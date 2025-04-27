@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QHBoxLayout, QLabel, QLineEdit, QPushButton,
                            QTextEdit, QFileDialog, QProgressBar, QMessageBox,
                            QSpinBox, QListWidget, QCalendarWidget, QGroupBox,
-                           QCheckBox, QDateEdit)
+                           QCheckBox, QDateEdit, QDialog)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QDate
 from log_collector import LogCollector
 
@@ -17,10 +17,12 @@ class LogCollectorWorker(QThread):
     progress = pyqtSignal(str, int, int)  # 文件名，当前进度，总大小
     finished = pyqtSignal(str)  # 完成信号
     error = pyqtSignal(str)     # 错误信号
+    file_list = pyqtSignal(list)  # 文件列表信号
     
-    def __init__(self, config):
+    def __init__(self, config, mode='collect'):
         super().__init__()
         self.config = config
+        self.mode = mode
         
     def run(self):
         try:
@@ -29,12 +31,76 @@ class LogCollectorWorker(QThread):
             collector.connect()
             
             try:
-                zip_path = collector.collect_logs()
-                self.finished.emit(zip_path)
+                if self.mode == 'collect':
+                    zip_path = collector.collect_logs()
+                    self.finished.emit(zip_path)
+                elif self.mode == 'list':
+                    # 获取文件列表
+                    for path in self.config['log_paths']:
+                        try:
+                            # 执行ls命令，按时间排序并只显示最新的10个文件
+                            cmd = f'ls -lt {path} | head -n 11'  # 11是因为第一行是total
+                            stdin, stdout, stderr = collector.client.exec_command(cmd)
+                            files = stdout.read().decode('utf-8').splitlines()
+                            
+                            # 移除第一行的total
+                            if files and files[0].startswith('total'):
+                                files = files[1:]
+                                
+                            # 解析文件信息
+                            file_info_list = []
+                            for line in files:
+                                parts = line.split()
+                                if len(parts) >= 9:  # 确保行包含足够的部分
+                                    # 提取文件名（可能包含空格的最后一部分）
+                                    filename = ' '.join(parts[8:])
+                                    # 提取日期时间
+                                    date_str = ' '.join(parts[5:8])
+                                    file_info_list.append({
+                                        'name': filename,
+                                        'date': date_str,
+                                        'path': path
+                                    })
+                            
+                            self.file_list.emit(file_info_list)
+                        except Exception as e:
+                            self.error.emit(f"列出目录 {path} 失败: {str(e)}")
             finally:
                 collector.close()
         except Exception as e:
             self.error.emit(str(e))
+
+class PathInputDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("添加远程目录路径")
+        self.setMinimumWidth(400)
+        
+        layout = QVBoxLayout(self)
+        
+        # 添加说明标签
+        info_label = QLabel("请输入远程主机上的日志目录完整路径\n例如：/var/log/车道系统/")
+        info_label.setStyleSheet("color: gray;")
+        layout.addWidget(info_label)
+        
+        # 添加输入框
+        self.path_input = QLineEdit()
+        self.path_input.setPlaceholderText("输入远程目录路径")
+        layout.addWidget(self.path_input)
+        
+        # 添加按钮
+        button_layout = QHBoxLayout()
+        ok_button = QPushButton("确定")
+        cancel_button = QPushButton("取消")
+        button_layout.addWidget(ok_button)
+        button_layout.addWidget(cancel_button)
+        layout.addLayout(button_layout)
+        
+        ok_button.clicked.connect(self.accept)
+        cancel_button.clicked.connect(self.reject)
+    
+    def get_path(self):
+        return self.path_input.text().strip()
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -122,7 +188,7 @@ class MainWindow(QMainWindow):
         path_layout = QVBoxLayout(path_group)
         
         # 添加路径说明
-        path_info = QLabel("请选择日志文件所在的目录，程序会自动查找并下载符合日期条件的日志文件\n支持的文件类型：.log 和 .zip")
+        path_info = QLabel("请输入日志文件所在的目录，程序会自动查找并下载符合日期条件的日志文件\n支持的文件类型：.log 和 .zip")
         path_info.setStyleSheet("color: gray;")
         path_layout.addWidget(path_info)
         
@@ -156,8 +222,11 @@ class MainWindow(QMainWindow):
         
         # 操作按钮
         button_layout = QHBoxLayout()
+        list_files_btn = QPushButton("列出最新文件")
+        list_files_btn.clicked.connect(self.list_files)
         self.start_button = QPushButton("开始收集")
         self.start_button.clicked.connect(self.start_collection)
+        button_layout.addWidget(list_files_btn)
         button_layout.addWidget(self.start_button)
         
         # 添加所有组件到主布局
@@ -170,7 +239,7 @@ class MainWindow(QMainWindow):
         
         # 加载配置
         self.load_config()
-        
+    
     def load_config(self):
         try:
             # 获取配置文件路径
@@ -230,45 +299,11 @@ class MainWindow(QMainWindow):
             self.log_message(f"保存配置文件失败: {str(e)}")
     
     def add_path(self):
-        # 创建输入对话框
-        dialog = QWidget()
-        dialog.setWindowTitle("添加远程目录路径")
-        dialog.setMinimumWidth(400)
-        
-        layout = QVBoxLayout(dialog)
-        
-        # 添加说明标签
-        info_label = QLabel("请输入远程主机上的日志目录完整路径\n例如：/var/log/车道系统/")
-        info_label.setStyleSheet("color: gray;")
-        layout.addWidget(info_label)
-        
-        # 添加输入框
-        path_input = QLineEdit()
-        path_input.setPlaceholderText("输入远程目录路径")
-        layout.addWidget(path_input)
-        
-        # 添加按钮
-        button_layout = QHBoxLayout()
-        ok_button = QPushButton("确定")
-        cancel_button = QPushButton("取消")
-        button_layout.addWidget(ok_button)
-        button_layout.addWidget(cancel_button)
-        layout.addLayout(button_layout)
-        
-        # 设置按钮事件
-        def on_ok():
-            path = path_input.text().strip()
+        dialog = PathInputDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            path = dialog.get_path()
             if path:
                 self.path_list.addItem(path)
-            dialog.close()
-            
-        def on_cancel():
-            dialog.close()
-            
-        ok_button.clicked.connect(on_ok)
-        cancel_button.clicked.connect(on_cancel)
-        
-        dialog.show()
     
     def remove_path(self):
         current_item = self.path_list.currentItem()
@@ -276,7 +311,7 @@ class MainWindow(QMainWindow):
             self.path_list.takeItem(self.path_list.row(current_item))
     
     def log_message(self, message):
-        self.log_display.append(message)
+        self.log_display.append(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {message}")
     
     def get_date_range(self):
         if self.use_date_range.isChecked():
@@ -284,6 +319,52 @@ class MainWindow(QMainWindow):
             end_date = self.end_date.date().toPyDate()
             return start_date, end_date
         return None, None
+    
+    def list_files(self):
+        if not self.host_input.text() or not self.username_input.text():
+            QMessageBox.warning(self, "错误", "请填写主机地址和用户名")
+            return
+        
+        if self.path_list.count() == 0:
+            QMessageBox.warning(self, "错误", "请添加至少一个日志文件路径")
+            return
+        
+        # 准备配置
+        config = {
+            'ssh': {
+                'host': self.host_input.text(),
+                'port': self.port_input.value(),
+                'username': self.username_input.text(),
+                'password': self.password_input.text()
+            },
+            'log_paths': [self.path_list.item(i).text() 
+                         for i in range(self.path_list.count())]
+        }
+        
+        # 禁用按钮
+        self.start_button.setEnabled(False)
+        self.log_message("正在获取文件列表...")
+        
+        # 创建工作线程
+        self.worker = LogCollectorWorker(config, mode='list')
+        self.worker.finished.connect(self.collection_finished)
+        self.worker.error.connect(self.collection_error)
+        self.worker.file_list.connect(self.show_file_list)
+        self.worker.start()
+    
+    def show_file_list(self, file_info_list):
+        if not file_info_list:
+            self.log_message("目录为空或无法访问")
+            return
+            
+        self.log_message("\n最新文件列表:")
+        for info in file_info_list:
+            self.log_message(f"目录: {info['path']}")
+            self.log_message(f"文件: {info['name']}")
+            self.log_message(f"日期: {info['date']}")
+            self.log_message("-" * 50)
+        
+        self.start_button.setEnabled(True)
     
     def start_collection(self):
         if not self.host_input.text() or not self.username_input.text():
@@ -344,7 +425,7 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.log_message(f"错误: {error_message}")
-        QMessageBox.critical(self, "错误", f"收集日志时发生错误：\n{error_message}")
+        QMessageBox.critical(self, "错误", f"操作失败：\n{error_message}")
 
 def main():
     app = QApplication(sys.argv)

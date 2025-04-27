@@ -28,7 +28,21 @@ wheels/
 .idea/
 .vscode/
 
-# 其他
+# 日志和临时文件
 *.log
 *.zip
-collected_logs/ 
+collected_logs/
+
+# 环境文件
+.env
+.venv
+env/
+venv/
+ENV/
+
+# 其他
+.DS_Store
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log* 
