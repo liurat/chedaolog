@@ -1,0 +1,14 @@
+ssh:
+  host: ""  # 车道系统的IP地址
+  port: 22  # SSH端口，默认22
+  username: ""  # SSH用户名
+  password: ""  # SSH密码
+
+# 需要收集的日志文件路径列表
+log_paths:
+  - "/path/to/logs"  # 替换为实际的日志目录路径
+
+# 说明：
+# 1. 支持的日志文件格式：.log 和 .zip
+# 2. 支持的文件名格式示例：CenterDevCtrl_2024-03-27.log 或 CenterDevCtrl_2024-03-27.zip
+# 3. 下载的日志文件将保存在程序所在目录的 collected_logs 文件夹中 
