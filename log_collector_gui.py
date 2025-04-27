@@ -40,7 +40,7 @@ class LogCollectorWorker(QThread):
                         try:
                             # 执行ls命令，按时间排序并只显示最新的10个文件
                             cmd = f'ls -lt {path} | head -n 11'  # 11是因为第一行是total
-                            stdin, stdout, stderr = collector.client.exec_command(cmd)
+                            stdin, stdout, stderr = collector.ssh.exec_command(cmd)
                             files = stdout.read().decode('utf-8').splitlines()
                             
                             # 移除第一行的total
