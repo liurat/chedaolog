@@ -173,17 +173,33 @@ class MainWindow(QMainWindow):
         
     def load_config(self):
         try:
-            with open('config.yaml', 'r', encoding='utf-8') as f:
+            # 获取配置文件路径
+            if getattr(sys, 'frozen', False):
+                # 如果是打包后的exe
+                base_path = sys._MEIPASS
+            else:
+                # 如果是开发环境
+                base_path = os.path.dirname(os.path.abspath(__file__))
+            
+            config_path = os.path.join(base_path, 'config.yaml')
+            
+            with open(config_path, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f)
-                self.host_input.setText(config['ssh']['host'])
+                self.host_input.setText(config['ssh'].get('host', ''))
                 self.port_input.setValue(config['ssh'].get('port', 22))
-                self.username_input.setText(config['ssh']['username'])
-                self.password_input.setText(config['ssh']['password'])
+                self.username_input.setText(config['ssh'].get('username', ''))
+                self.password_input.setText(config['ssh'].get('password', ''))
                 
-                for path in config['log_paths']:
-                    self.path_list.addItem(path)
+                for path in config.get('log_paths', []):
+                    if path and path.strip() != "/path/to/logs":
+                        self.path_list.addItem(path)
         except Exception as e:
             self.log_message(f"加载配置文件失败: {str(e)}")
+            # 使用默认配置
+            self.host_input.setText("")
+            self.port_input.setValue(22)
+            self.username_input.setText("")
+            self.password_input.setText("")
     
     def save_config(self):
         config = {
@@ -198,15 +214,61 @@ class MainWindow(QMainWindow):
         }
         
         try:
-            with open('config.yaml', 'w', encoding='utf-8') as f:
+            # 获取配置文件保存路径
+            if getattr(sys, 'frozen', False):
+                # 如果是打包后的exe，保存在exe所在目录
+                base_path = os.path.dirname(sys.executable)
+            else:
+                # 如果是开发环境
+                base_path = os.path.dirname(os.path.abspath(__file__))
+            
+            config_path = os.path.join(base_path, 'config.yaml')
+            
+            with open(config_path, 'w', encoding='utf-8') as f:
                 yaml.dump(config, f, allow_unicode=True)
         except Exception as e:
             self.log_message(f"保存配置文件失败: {str(e)}")
     
     def add_path(self):
-        path = QFileDialog.getExistingDirectory(self, "选择日志文件目录")
-        if path:
-            self.path_list.addItem(path)
+        # 创建输入对话框
+        dialog = QWidget()
+        dialog.setWindowTitle("添加远程目录路径")
+        dialog.setMinimumWidth(400)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # 添加说明标签
+        info_label = QLabel("请输入远程主机上的日志目录完整路径\n例如：/var/log/车道系统/")
+        info_label.setStyleSheet("color: gray;")
+        layout.addWidget(info_label)
+        
+        # 添加输入框
+        path_input = QLineEdit()
+        path_input.setPlaceholderText("输入远程目录路径")
+        layout.addWidget(path_input)
+        
+        # 添加按钮
+        button_layout = QHBoxLayout()
+        ok_button = QPushButton("确定")
+        cancel_button = QPushButton("取消")
+        button_layout.addWidget(ok_button)
+        button_layout.addWidget(cancel_button)
+        layout.addLayout(button_layout)
+        
+        # 设置按钮事件
+        def on_ok():
+            path = path_input.text().strip()
+            if path:
+                self.path_list.addItem(path)
+            dialog.close()
+            
+        def on_cancel():
+            dialog.close()
+            
+        ok_button.clicked.connect(on_ok)
+        cancel_button.clicked.connect(on_cancel)
+        
+        dialog.show()
     
     def remove_path(self):
         current_item = self.path_list.currentItem()
