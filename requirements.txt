@@ -2,4 +2,5 @@ pyyaml
 paramiko
 tqdm
 PyQt6
-pillow 
+pillow
+scp 

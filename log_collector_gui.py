@@ -38,29 +38,67 @@ class LogCollectorWorker(QThread):
                     # 获取文件列表
                     for path in self.config['log_paths']:
                         try:
-                            # 执行ls命令，按时间排序并只显示最新的10个文件
-                            cmd = f'ls -lt {path} | head -n 11'  # 11是因为第一行是total
-                            stdin, stdout, stderr = collector.ssh.exec_command(cmd)
-                            files = stdout.read().decode('utf-8').splitlines()
-                            
-                            # 移除第一行的total
-                            if files and files[0].startswith('total'):
-                                files = files[1:]
+                            # 根据系统类型选择命令
+                            if collector.is_remote_windows():
+                                # Windows系统使用dir命令
+                                cmd = f'dir /O-D "{path}"'
+                                stdin, stdout, stderr = collector.ssh.exec_command(cmd)
+                                files = stdout.read().decode('utf-8', errors='ignore').splitlines()
                                 
-                            # 解析文件信息
-                            file_info_list = []
-                            for line in files:
-                                parts = line.split()
-                                if len(parts) >= 9:  # 确保行包含足够的部分
-                                    # 提取文件名（可能包含空格的最后一部分）
-                                    filename = ' '.join(parts[8:])
-                                    # 提取日期时间
-                                    date_str = ' '.join(parts[5:8])
-                                    file_info_list.append({
-                                        'name': filename,
-                                        'date': date_str,
-                                        'path': path
-                                    })
+                                # 跳过Windows dir命令的头部信息
+                                start_idx = 0
+                                for i, line in enumerate(files):
+                                    if "Directory of" in line:
+                                        start_idx = i + 2
+                                        break
+                                
+                                files = files[start_idx:]
+                                
+                                # 解析文件信息
+                                file_info_list = []
+                                for line in files:
+                                    if not line.strip() or "<DIR>" in line:
+                                        continue
+                                    
+                                    parts = line.strip().split()
+                                    if len(parts) >= 4:
+                                        # Windows dir命令格式: 日期 时间 大小 文件名
+                                        try:
+                                            date_str = parts[0]
+                                            time_str = parts[1]
+                                            # 文件名可能包含空格，所以要合并后面的所有部分
+                                            filename = ' '.join(parts[3:])
+                                            file_info_list.append({
+                                                'name': filename,
+                                                'date': f"{date_str} {time_str}",
+                                                'path': path
+                                            })
+                                        except:
+                                            continue
+                            else:
+                                # Linux系统使用ls命令
+                                cmd = f'ls -lt {path} | head -n 11'  # 11是因为第一行是total
+                                stdin, stdout, stderr = collector.ssh.exec_command(cmd)
+                                files = stdout.read().decode('utf-8').splitlines()
+                                
+                                # 移除第一行的total
+                                if files and files[0].startswith('total'):
+                                    files = files[1:]
+                                
+                                # 解析文件信息
+                                file_info_list = []
+                                for line in files:
+                                    parts = line.split()
+                                    if len(parts) >= 9:  # 确保行包含足够的部分
+                                        # 提取文件名（可能包含空格的最后一部分）
+                                        filename = ' '.join(parts[8:])
+                                        # 提取日期时间
+                                        date_str = ' '.join(parts[5:8])
+                                        file_info_list.append({
+                                            'name': filename,
+                                            'date': date_str,
+                                            'path': path
+                                        })
                             
                             self.file_list.emit(file_info_list)
                         except Exception as e:

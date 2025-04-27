@@ -18,6 +18,8 @@ class LogCollector:
         self.sftp = None
         # 支持的文件后缀
         self.supported_extensions = ('.log', '.zip')
+        # 记录远程系统类型
+        self._is_windows = None
 
     def setup_logging(self):
         logging.basicConfig(
@@ -124,17 +126,50 @@ class LogCollector:
                     date_range['end_date'], '%Y-%m-%d').date()
                 self.logger.info(f"使用日期范围: {start_date} 到 {end_date}")
 
+            # 检查远程系统类型
+            is_windows = self.is_remote_windows()
+            self.logger.info(f"远程系统类型: {'Windows' if is_windows else 'Linux/Unix'}")
+
             # 收集每个指定的日志文件
             for log_path in self.config['log_paths']:
                 try:
                     remote_path = log_path.strip()
+                    self.logger.info(f"处理路径: {remote_path}")
                     
                     # 如果路径是目录，则列出目录中的所有文件
                     try:
-                        files = self.sftp.listdir(remote_path)
-                        is_dir = True
-                        self.logger.info(f"在目录 {remote_path} 中找到 {len(files)} 个文件")
-                    except:
+                        # 尝试列出目录
+                        try:
+                            files = self.sftp.listdir(remote_path)
+                            is_dir = True
+                            self.logger.info(f"在目录 {remote_path} 中找到 {len(files)} 个文件")
+                        except Exception as e:
+                            # 如果listdir失败，可能是因为这是一个文件而不是目录
+                            # 或者是权限问题
+                            self.logger.warning(f"无法列出目录 {remote_path}: {str(e)}")
+                            
+                            # 尝试使用命令行方式列出文件
+                            if is_windows:
+                                cmd = f'dir /b "{remote_path}"'
+                            else:
+                                cmd = f'ls -1 {remote_path}'
+                                
+                            stdin, stdout, stderr = self.ssh.exec_command(cmd)
+                            cmd_output = stdout.read().decode('utf-8', errors='ignore')
+                            err_output = stderr.read().decode('utf-8', errors='ignore')
+                            
+                            if err_output and not cmd_output:
+                                # 如果有错误输出但没有标准输出，可能是路径问题
+                                self.logger.warning(f"命令行列出目录失败 {remote_path}: {err_output}")
+                                files = [os.path.basename(remote_path)]
+                                is_dir = False
+                            else:
+                                # 成功获取文件列表
+                                files = [f.strip() for f in cmd_output.splitlines() if f.strip()]
+                                is_dir = True
+                    except Exception as e:
+                        # 如果所有方法都失败，假设是单个文件
+                        self.logger.warning(f"假设 {remote_path} 是单个文件: {str(e)}")
                         files = [os.path.basename(remote_path)]
                         is_dir = False
                     
@@ -147,7 +182,15 @@ class LogCollector:
                     self.logger.info(f"找到 {len(files)} 个支持的日志文件")
 
                     for filename in files:
-                        full_remote_path = os.path.join(remote_path, filename) if is_dir else remote_path
+                        # 构建完整的远程路径
+                        if is_dir:
+                            # 使用正确的路径分隔符
+                            if is_windows:
+                                full_remote_path = remote_path.rstrip('\\') + '\\' + filename
+                            else:
+                                full_remote_path = os.path.join(remote_path, filename)
+                        else:
+                            full_remote_path = remote_path
                         
                         # 检查日期范围
                         if use_date_range:
@@ -159,17 +202,39 @@ class LogCollector:
                         
                         local_path = os.path.join(local_dir, filename)
                         
-                        # 获取远程文件大小
+                        # 获取远程文件并下载
                         try:
-                            stats = self.sftp.stat(full_remote_path)
-                            total_size = stats.st_size
+                            self.logger.info(f"尝试下载文件: {full_remote_path}")
                             
-                            with tqdm(total=total_size, unit='B', unit_scale=True, 
-                                    desc=f"下载 {filename}") as pbar:
-                                self.sftp.get(full_remote_path, local_path, 
-                                            callback=lambda x, y: pbar.update(y - pbar.n))
-                            
-                            self.logger.info(f"成功下载文件: {filename}")
+                            # 获取远程文件大小
+                            try:
+                                stats = self.sftp.stat(full_remote_path)
+                                total_size = stats.st_size
+                                
+                                with tqdm(total=total_size, unit='B', unit_scale=True, 
+                                        desc=f"下载 {filename}") as pbar:
+                                    self.sftp.get(full_remote_path, local_path, 
+                                                callback=lambda x, y: pbar.update(y - pbar.n))
+                                
+                                self.logger.info(f"成功下载文件: {filename}")
+                            except Exception as e:
+                                self.logger.error(f"使用SFTP下载 {filename} 失败: {str(e)}")
+                                # 尝试使用SCP方式下载
+                                self.logger.info(f"尝试使用命令行方式下载 {filename}")
+                                
+                                # 创建一个与远程服务器的SCP会话
+                                try:
+                                    import paramiko
+                                    from scp import SCPClient
+                                    
+                                    # 创建SCP客户端
+                                    with SCPClient(self.ssh.get_transport()) as scp:
+                                        scp.get(full_remote_path, local_path)
+                                    
+                                    self.logger.info(f"使用SCP成功下载文件: {filename}")
+                                except Exception as scp_e:
+                                    self.logger.error(f"SCP下载 {filename} 失败: {str(scp_e)}")
+                                    continue
                         except Exception as e:
                             self.logger.error(f"下载文件 {filename} 失败: {str(e)}")
                             continue
@@ -205,6 +270,33 @@ class LogCollector:
         if self.ssh:
             self.ssh.close()
         self.logger.info("SSH连接已关闭")
+
+    def is_remote_windows(self):
+        """检测远程系统是否为Windows"""
+        if self._is_windows is not None:
+            return self._is_windows
+            
+        try:
+            # 尝试执行Windows特有的命令
+            stdin, stdout, stderr = self.ssh.exec_command('ver')
+            output = stdout.read().decode('utf-8', errors='ignore')
+            
+            # 检查输出中是否包含"Windows"字样
+            self._is_windows = 'Windows' in output
+            return self._is_windows
+        except:
+            # 如果命令执行失败，尝试使用其他方法
+            try:
+                stdin, stdout, stderr = self.ssh.exec_command('uname')
+                output = stdout.read().decode('utf-8', errors='ignore')
+                
+                # 如果能成功执行uname命令，通常是类Unix系统
+                self._is_windows = False
+                return False
+            except:
+                # 如果两种检测都失败，默认假设为Linux
+                self._is_windows = False
+                return False
 
 def main():
     collector = LogCollector()
