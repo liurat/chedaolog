@@ -26,7 +26,7 @@ class LogCollectorWorker(QThread):
         
     def run(self):
         try:
-            collector = LogCollector(config_file=None)
+            collector = LogCollector(config_file=None, progress_callback=self.update_progress)
             collector.config = self.config
             collector.connect()
             
@@ -107,6 +107,17 @@ class LogCollectorWorker(QThread):
                 collector.close()
         except Exception as e:
             self.error.emit(str(e))
+
+    def update_progress(self, filename, current, total):
+        """
+        更新进度条
+        Args:
+            filename: 当前正在下载的文件名
+            current: 当前已下载的字节数
+            total: 文件总字节数
+        """
+        # 发送进度信号
+        self.progress.emit(filename, current, total)
 
 class PathInputDialog(QDialog):
     def __init__(self, parent=None):
@@ -442,12 +453,29 @@ class MainWindow(QMainWindow):
         # 禁用开始按钮
         self.start_button.setEnabled(False)
         self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
         
         # 创建工作线程
         self.worker = LogCollectorWorker(config)
         self.worker.finished.connect(self.collection_finished)
         self.worker.error.connect(self.collection_error)
+        self.worker.progress.connect(self.update_progress)
         self.worker.start()
+        
+        self.log_message("开始收集日志文件...")
+    
+    def update_progress(self, filename, current, total):
+        """
+        更新进度条显示
+        """
+        if total <= 0:
+            # 防止除零错误
+            percent = 0
+        else:
+            percent = int(current * 100 / total)
+        
+        self.progress_bar.setValue(percent)
+        self.log_message(f"正在下载: {filename} ({percent}%)")
     
     def collection_finished(self, zip_path):
         self.start_button.setEnabled(True)

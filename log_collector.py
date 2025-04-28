@@ -26,11 +26,12 @@ class LogCollector:
     日志收集器类
     负责连接远程服务器、查找和下载日志文件、打包压缩等核心功能
     """
-    def __init__(self, config_file='config.yaml'):
+    def __init__(self, config_file='config.yaml', progress_callback=None):
         """
         初始化日志收集器
         Args:
             config_file: 配置文件路径，默认为'config.yaml'
+            progress_callback: 进度回调函数，用于通知界面下载进度
         """
         self.setup_logging()  # 设置日志记录
         self.load_config(config_file)  # 加载配置文件
@@ -40,6 +41,8 @@ class LogCollector:
         self.supported_extensions = ('.log', '.zip')
         # 缓存远程系统类型（Windows/Linux）
         self._is_windows = None
+        # 进度回调函数
+        self.progress_callback = progress_callback
 
     def setup_logging(self):
         """
@@ -297,8 +300,16 @@ class LogCollector:
                                 # 使用进度条显示下载进度
                                 with tqdm(total=total_size, unit='B', unit_scale=True, 
                                         desc=f"下载 {filename}") as pbar:
-                                    self.sftp.get(full_remote_path, local_path, 
-                                                callback=lambda x, y: pbar.update(y - pbar.n))
+                                    
+                                    # 添加自定义的更新函数以同时通知进度条和回调函数
+                                    def update_progress(transferred, total):
+                                        # 更新tqdm进度条
+                                        pbar.update(transferred - pbar.n)
+                                        # 如果有回调函数，通知界面更新进度
+                                        if self.progress_callback:
+                                            self.progress_callback(filename, transferred, total)
+                                    
+                                    self.sftp.get(full_remote_path, local_path, callback=update_progress)
                                 
                                 self.logger.info(f"成功下载文件: {filename}")
                             except Exception as e:
@@ -312,7 +323,15 @@ class LogCollector:
                                     
                                     # 创建SCP客户端并下载
                                     with SCPClient(self.ssh.get_transport()) as scp:
+                                        # SCP不支持进度回调，所以先通知界面开始下载
+                                        if self.progress_callback:
+                                            self.progress_callback(filename, 0, 100)
+                                        
                                         scp.get(full_remote_path, local_path)
+                                        
+                                        # 下载完成后通知界面进度100%
+                                        if self.progress_callback:
+                                            self.progress_callback(filename, 100, 100)
                                     
                                     self.logger.info(f"使用SCP成功下载文件: {filename}")
                                 except Exception as scp_e:
