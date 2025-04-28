@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QSizePolicy, QListWidgetItem, QSplitter)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QDate
 from log_collector import LogCollector
+import re
 
 class LogCollectorWorker(QThread):
     progress = pyqtSignal(str, int, int)  # 文件名，当前进度，总大小
@@ -28,6 +29,11 @@ class LogCollectorWorker(QThread):
         
     def run(self):
         try:
+            # 检查是否为本地测试模式
+            if self.is_local_test_mode():
+                self.handle_local_test_mode()
+                return
+                
             collector = LogCollector(config_file=None, progress_callback=self.update_progress)
             collector.config = self.config
             collector.connect()
@@ -117,6 +123,144 @@ class LogCollectorWorker(QThread):
                 collector.close()
         except Exception as e:
             self.error.emit(str(e))
+
+    def is_local_test_mode(self):
+        """检查是否为本地测试模式"""
+        return (self.config.get('ssh', {}).get('host') == '127.0.0.1' and 
+                self.config.get('ssh', {}).get('username') == 'liurat' and 
+                self.config.get('ssh', {}).get('password') == '123456')
+    
+    def handle_local_test_mode(self):
+        """处理本地测试模式"""
+        try:
+            if self.mode == 'collect':
+                self.collect_local_logs()
+            elif self.mode == 'list':
+                self.list_local_files()
+        except Exception as e:
+            self.error.emit(f"本地测试模式出错: {str(e)}")
+    
+    def list_local_files(self):
+        """列出本地测试目录中的文件"""
+        try:
+            file_info_list = []
+            
+            # 遍历所有日志路径
+            for path in self.config['log_paths']:
+                if os.path.exists(path) and os.path.isdir(path):
+                    # 获取目录中的所有文件
+                    files = os.listdir(path)
+                    
+                    for file in files:
+                        file_path = os.path.join(path, file)
+                        if os.path.isfile(file_path):
+                            # 获取文件修改时间
+                            mod_time = os.path.getmtime(file_path)
+                            date_str = datetime.fromtimestamp(mod_time).strftime('%Y-%m-%d %H:%M:%S')
+                            
+                            file_info_list.append({
+                                'name': file,
+                                'date': date_str,
+                                'path': path
+                            })
+            
+            # 按修改时间排序
+            file_info_list.sort(key=lambda x: x['date'], reverse=True)
+            
+            # 仅发送前10个文件
+            self.file_list.emit(file_info_list[:10])
+        except Exception as e:
+            self.error.emit(f"列出本地文件失败: {str(e)}")
+    
+    def collect_local_logs(self):
+        """从本地测试目录收集日志"""
+        import zipfile
+        import tempfile
+        import shutil
+        
+        # 创建临时目录存放收集的日志
+        temp_dir = tempfile.mkdtemp()
+        zip_path = None
+        
+        try:
+            # 要收集的文件列表
+            collected_files = []
+            
+            # 遍历所有日志路径
+            for path in self.config['log_paths']:
+                if os.path.exists(path) and os.path.isdir(path):
+                    # 获取目录中的所有文件
+                    files = os.listdir(path)
+                    
+                    # 筛选符合条件的文件
+                    for file in files:
+                        file_path = os.path.join(path, file)
+                        if os.path.isfile(file_path):
+                            # 检查文件类型
+                            if file.endswith(('.log', '.zip')):
+                                # 检查日期范围
+                                if 'date_range' in self.config and self.config['date_range'].get('enabled', False):
+                                    # 尝试从文件名中提取日期
+                                    import re
+                                    date_match = re.search(r'(\d{4}-\d{2}-\d{2})', file)
+                                    
+                                    if date_match:
+                                        file_date_str = date_match.group(1)
+                                        try:
+                                            file_date = datetime.strptime(file_date_str, '%Y-%m-%d').date()
+                                            start_date = datetime.strptime(
+                                                self.config['date_range']['start_date'], '%Y-%m-%d').date()
+                                            end_date = datetime.strptime(
+                                                self.config['date_range']['end_date'], '%Y-%m-%d').date()
+                                            
+                                            # 检查日期是否在范围内
+                                            if start_date <= file_date <= end_date:
+                                                collected_files.append(file_path)
+                                        except Exception as e:
+                                            # 如果日期解析失败，跳过此文件
+                                            continue
+                                else:
+                                    # 如果没有日期筛选，直接添加
+                                    collected_files.append(file_path)
+            
+            # 如果没有找到符合条件的文件
+            if not collected_files:
+                self.finished.emit("")
+                return
+            
+            # 拷贝文件到临时目录
+            for i, file_path in enumerate(collected_files):
+                file_name = os.path.basename(file_path)
+                dest_path = os.path.join(temp_dir, file_name)
+                
+                # 更新进度
+                self.progress.emit(file_name, i, len(collected_files))
+                
+                # 复制文件
+                shutil.copy2(file_path, dest_path)
+            
+            # 创建zip文件
+            timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+            zip_path = os.path.join(os.getcwd(), f'collected_logs_{timestamp}.zip')
+            
+            with zipfile.ZipFile(zip_path, 'w') as zipf:
+                for file in os.listdir(temp_dir):
+                    file_path = os.path.join(temp_dir, file)
+                    # 更新进度
+                    self.progress.emit(file, len(collected_files), len(collected_files))
+                    zipf.write(file_path, os.path.basename(file_path))
+            
+            self.finished.emit(zip_path)
+        
+        except Exception as e:
+            self.error.emit(f"本地收集日志失败: {str(e)}")
+            if zip_path and os.path.exists(zip_path):
+                os.remove(zip_path)
+            self.finished.emit("")
+        
+        finally:
+            # 清理临时目录
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     def update_progress(self, filename, current, total):
         """
@@ -399,6 +543,11 @@ class LogAnalysisWorker(QThread):
         
     def run(self):
         try:
+            # 检查是否为本地测试模式
+            if self.is_local_test_mode():
+                self.handle_local_test_mode()
+                return
+                
             collector = LogCollector(config_file=None)
             collector.config = self.config
             collector.connect()
@@ -523,21 +672,93 @@ class LogAnalysisWorker(QThread):
             # 在本地文件中搜索
             found_lines = []
             line_numbers = []
+            matching_records = []  # 存储匹配的完整记录
+            earliest_time = None
+            latest_time = None
+            time_pattern = re.compile(r'(\d{2}:\d{2}:\d{2}(?:\.\d+)?)')
             
             try:
                 # 尝试多种编码打开文件
                 file_content = self._read_file_with_encoding(cache_file)
                 
-                # 搜索关键字
-                for i, line in enumerate(file_content, 1):
-                    if self.keyword in line:
-                        found_lines.append(line.strip())
-                        line_numbers.append(i)
+                # 先处理多行JSON记录
+                i = 0
+                while i < len(file_content):
+                    line = file_content[i].strip()
+                    
+                    # 检查是否是JSON记录的开始（包含大括号）
+                    if "{" in line and not line.strip().endswith("}"):
+                        record_start = i
+                        record_lines = [line]
+                        json_content = line
+                        
+                        # 尝试继续读取，直到找到匹配的结束大括号
+                        j = i + 1
+                        while j < len(file_content) and "}" not in file_content[j]:
+                            record_lines.append(file_content[j].strip())
+                            json_content += file_content[j]
+                            j += 1
+                        
+                        # 如果找到了结束括号，添加最后一行
+                        if j < len(file_content):
+                            record_lines.append(file_content[j].strip())
+                            json_content += file_content[j]
+                            
+                            # 检查整个JSON是否包含关键字
+                            if self.keyword in json_content:
+                                # 将整个记录标记为匹配项
+                                matching_records.append((record_start, j, record_lines))
+                                
+                                # 尝试从第一行提取时间
+                                first_line = record_lines[0]
+                                time_match = time_pattern.search(first_line)
+                                if time_match:
+                                    time_str = time_match.group(1)
+                                    if earliest_time is None or time_str < earliest_time:
+                                        earliest_time = time_str
+                                    if latest_time is None or time_str > latest_time:
+                                        latest_time = time_str
+                            
+                            i = j  # 跳过整个JSON记录
+                        else:
+                            i += 1  # 如果没有找到结束括号，继续处理下一行
+                    else:
+                        # 处理普通行
+                        if self.keyword in line:
+                            found_lines.append(line)
+                            line_numbers.append(i)
+                            
+                            # 尝试从行中提取时间
+                            time_match = time_pattern.search(line)
+                            if time_match:
+                                time_str = time_match.group(1)
+                                if earliest_time is None or time_str < earliest_time:
+                                    earliest_time = time_str
+                                if latest_time is None or time_str > latest_time:
+                                    latest_time = time_str
+                        
+                        i += 1
                 
                 # 检查结果
-                if found_lines:
-                    self.log_message(f"找到 {len(found_lines)} 个匹配项")
-                    self.search_result.emit(self.keyword, found_lines)
+                total_matches = len(found_lines) + len(matching_records)
+                if total_matches > 0:
+                    self.log_message(f"找到 {total_matches} 个匹配项，时间范围: {earliest_time} - {latest_time}")
+                    
+                    # 如果找到了时间范围，再次处理文件以获取这个时间范围内的所有日志
+                    if earliest_time and latest_time:
+                        all_lines_in_timerange = self._get_full_log_context(file_content, earliest_time, latest_time, time_pattern)
+                        
+                        if all_lines_in_timerange:
+                            self.log_message(f"时间范围内共 {len(all_lines_in_timerange)} 行日志")
+                            self.search_result.emit(self.keyword, all_lines_in_timerange)
+                            return
+                    
+                    # 如果没有找到时间范围或处理失败，合并匹配的单行和记录
+                    all_matched_lines = found_lines.copy()
+                    for _, _, record_lines in matching_records:
+                        all_matched_lines.extend(record_lines)
+                    
+                    self.search_result.emit(self.keyword, all_matched_lines)
                     return
                 else:
                     self.log_message("搜索未找到匹配结果")
@@ -820,6 +1041,300 @@ class LogAnalysisWorker(QThread):
             self.log_message("使用二进制模式读取文件并手动解码")
         
         return file_content
+
+    def is_local_test_mode(self):
+        """检查是否为本地测试模式"""
+        return (self.config.get('ssh', {}).get('host') == '127.0.0.1' and 
+                self.config.get('ssh', {}).get('username') == 'liurat' and 
+                self.config.get('ssh', {}).get('password') == '123456')
+    
+    def handle_local_test_mode(self):
+        """处理本地测试模式"""
+        try:
+            if self.mode == 'list':
+                self.get_local_log_files()
+            elif self.mode == 'search':
+                self.search_local_keyword()
+            elif self.mode == 'get_log':
+                self.get_local_full_log()
+        except Exception as e:
+            self.error.emit(f"本地测试模式出错: {str(e)}")
+    
+    def get_local_log_files(self):
+        """获取本地日志文件列表"""
+        all_logs = []
+        
+        for path in self.config['log_paths']:
+            try:
+                if os.path.exists(path) and os.path.isdir(path):
+                    # 获取目录中的所有文件
+                    files = [f for f in os.listdir(path) if os.path.isfile(os.path.join(path, f))]
+                    
+                    # 过滤出支持的文件类型
+                    supported_files = []
+                    for file in files:
+                        # 检查是否为.log或.zip文件
+                        if file.endswith(('.log', '.zip')):
+                            # 检查日期范围
+                            if 'date_range' in self.config and self.config['date_range'].get('enabled', False):
+                                # 尝试从文件名中提取日期
+                                import re
+                                date_match = re.search(r'(\d{4}-\d{2}-\d{2})', file)
+                                
+                                if date_match:
+                                    file_date_str = date_match.group(1)
+                                    try:
+                                        file_date = datetime.strptime(file_date_str, '%Y-%m-%d').date()
+                                        start_date = datetime.strptime(
+                                            self.config['date_range']['start_date'], '%Y-%m-%d').date()
+                                        end_date = datetime.strptime(
+                                            self.config['date_range']['end_date'], '%Y-%m-%d').date()
+                                        
+                                        # 检查日期是否在范围内
+                                        if start_date <= file_date <= end_date:
+                                            full_path = os.path.join(path, file)
+                                            supported_files.append({
+                                                'name': file,
+                                                'path': full_path
+                                            })
+                                    except:
+                                        # 如果日期解析失败，跳过此文件
+                                        continue
+                            else:
+                                # 如果没有日期筛选，直接添加
+                                full_path = os.path.join(path, file)
+                                supported_files.append({
+                                    'name': file,
+                                    'path': full_path
+                                })
+                    
+                    all_logs.extend(supported_files)
+            except Exception as e:
+                self.error.emit(f"获取本地目录 {path} 中的日志列表失败: {str(e)}")
+        
+        # 发送日志列表信号
+        self.log_list.emit(all_logs)
+    
+    def search_local_keyword(self):
+        """在本地日志文件中搜索关键字"""
+        try:
+            if not self.log_path or not self.keyword:
+                self.error.emit("未指定日志文件或关键字")
+                return
+            
+            self.log_message(f"准备在本地文件中搜索关键字: '{self.keyword}'")
+            
+            if not os.path.exists(self.log_path):
+                self.error.emit(f"文件不存在: {self.log_path}")
+                return
+            
+            # 搜索关键字
+            found_lines = []
+            matching_records = []  # 存储匹配的完整记录
+            earliest_time = None
+            latest_time = None
+            time_pattern = re.compile(r'(\d{2}:\d{2}:\d{2}(?:\.\d+)?)')
+            file_content = []
+            
+            try:
+                # 尝试多种编码打开文件
+                encodings = ['utf-8', 'gbk', 'gb18030', 'latin1']
+                
+                # 先读取整个文件内容
+                for encoding in encodings:
+                    try:
+                        with open(self.log_path, 'r', encoding=encoding) as f:
+                            file_content = f.readlines()
+                        # 如果成功读取，跳出循环
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                
+                # 如果所有编码都失败，使用二进制模式读取
+                if not file_content and not any(self.log_path.endswith(ext) for ext in ['.zip']):
+                    with open(self.log_path, 'rb') as f:
+                        binary_content = f.read()
+                        text_content = binary_content.decode('utf-8', errors='ignore')
+                        file_content = text_content.splitlines(True)
+                
+                # 处理多行JSON记录和关键字搜索
+                i = 0
+                while i < len(file_content):
+                    line = file_content[i].strip()
+                    
+                    # 检查是否是JSON记录的开始（包含大括号）
+                    if "{" in line and not line.strip().endswith("}"):
+                        record_start = i
+                        record_lines = [line]
+                        json_content = line
+                        
+                        # 尝试继续读取，直到找到匹配的结束大括号
+                        j = i + 1
+                        while j < len(file_content) and "}" not in file_content[j]:
+                            record_lines.append(file_content[j].strip())
+                            json_content += file_content[j]
+                            j += 1
+                        
+                        # 如果找到了结束括号，添加最后一行
+                        if j < len(file_content):
+                            record_lines.append(file_content[j].strip())
+                            json_content += file_content[j]
+                            
+                            # 检查整个JSON是否包含关键字
+                            if self.keyword in json_content:
+                                # 将整个记录标记为匹配项
+                                matching_records.append((record_start, j, record_lines))
+                                
+                                # 尝试从第一行提取时间
+                                first_line = record_lines[0]
+                                time_match = time_pattern.search(first_line)
+                                if time_match:
+                                    time_str = time_match.group(1)
+                                    if earliest_time is None or time_str < earliest_time:
+                                        earliest_time = time_str
+                                    if latest_time is None or time_str > latest_time:
+                                        latest_time = time_str
+                            
+                            i = j  # 跳过整个JSON记录
+                        else:
+                            i += 1  # 如果没有找到结束括号，继续处理下一行
+                    else:
+                        # 处理普通行
+                        if self.keyword in line:
+                            found_lines.append(line)
+                            
+                            # 尝试从行中提取时间
+                            time_match = time_pattern.search(line)
+                            if time_match:
+                                time_str = time_match.group(1)
+                                if earliest_time is None or time_str < earliest_time:
+                                    earliest_time = time_str
+                                if latest_time is None or time_str > latest_time:
+                                    latest_time = time_str
+                        
+                        i += 1
+                
+                # 如果找到了匹配项和时间范围，再次处理以获取这个时间范围内的所有日志
+                total_matches = len(found_lines) + len(matching_records)
+                if total_matches > 0 and earliest_time and latest_time:
+                    all_lines_in_timerange = self._get_full_log_context(file_content, earliest_time, latest_time, time_pattern)
+                    
+                    if all_lines_in_timerange:
+                        self.log_message(f"找到 {total_matches} 个匹配项，时间范围: {earliest_time} - {latest_time}")
+                        self.log_message(f"时间范围内共 {len(all_lines_in_timerange)} 行日志")
+                        self.search_result.emit(self.keyword, all_lines_in_timerange)
+                        return
+                
+                # 如果没有找到时间范围或处理失败，合并匹配的单行和记录
+                if total_matches > 0:
+                    all_matched_lines = found_lines.copy()
+                    for _, _, record_lines in matching_records:
+                        all_matched_lines.extend(record_lines)
+                    
+                    self.log_message(f"找到 {total_matches} 个匹配项")
+                    self.search_result.emit(self.keyword, all_matched_lines)
+                else:
+                    self.log_message("搜索未找到匹配结果")
+                    self.search_result.emit(self.keyword, [])
+            
+            except Exception as e:
+                self.error.emit(f"搜索本地文件失败: {str(e)}")
+                self.search_result.emit(self.keyword, [])
+        
+        except Exception as e:
+            self.error.emit(f"本地搜索关键字失败: {str(e)}")
+    
+    def get_local_full_log(self):
+        """获取本地日志完整内容"""
+        try:
+            if not self.log_path:
+                self.error.emit("未指定日志文件")
+                return
+            
+            if not os.path.exists(self.log_path):
+                self.error.emit(f"文件不存在: {self.log_path}")
+                return
+            
+            # 检查文件大小
+            file_size = os.path.getsize(self.log_path)
+            if file_size > 10 * 1024 * 1024:  # 大于10MB
+                self.error.emit(f"文件太大 ({file_size/1024/1024:.1f}MB)，请使用关键字搜索缩小范围")
+                return
+            
+            # 读取文件内容
+            try:
+                # 尝试多种编码打开文件
+                encodings = ['utf-8', 'gbk', 'gb18030', 'latin1']
+                log_content = None
+                
+                for encoding in encodings:
+                    try:
+                        with open(self.log_path, 'r', encoding=encoding) as f:
+                            log_content = f.read()
+                        self.log_message(f"成功使用编码 {encoding} 打开文件")
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                
+                # 如果所有编码都失败，使用二进制模式读取
+                if log_content is None:
+                    with open(self.log_path, 'rb') as f:
+                        binary_content = f.read()
+                        log_content = binary_content.decode('utf-8', errors='ignore')
+                    self.log_message("使用二进制模式读取文件并手动解码")
+                
+                # 发送完整日志信号
+                self.complete_log.emit(log_content)
+            
+            except Exception as e:
+                self.error.emit(f"读取本地文件失败: {str(e)}")
+        
+        except Exception as e:
+            self.error.emit(f"获取本地日志内容失败: {str(e)}")
+
+    def _get_full_log_context(self, file_content, earliest_time, latest_time, time_pattern):
+        """获取完整日志上下文，包括处理多行JSON结构"""
+        all_lines_in_timerange = []
+        i = 0
+        
+        while i < len(file_content):
+            line = file_content[i].strip()
+            
+            # 检查是否包含时间
+            time_match = time_pattern.search(line)
+            in_time_range = False
+            
+            if time_match:
+                time_str = time_match.group(1)
+                in_time_range = earliest_time <= time_str <= latest_time
+            
+            # 如果在时间范围内
+            if in_time_range:
+                # 检查是否是JSON记录的开始（包含大括号）
+                if "{" in line and not line.strip().endswith("}"):
+                    # 这是一个多行JSON记录的开始
+                    record_lines = [line]
+                    
+                    # 继续读取，直到找到匹配的结束大括号
+                    j = i + 1
+                    while j < len(file_content) and "}" not in file_content[j]:
+                        record_lines.append(file_content[j].strip())
+                        j += 1
+                    
+                    # 如果找到了结束括号，添加最后一行
+                    if j < len(file_content):
+                        record_lines.append(file_content[j].strip())
+                        # 将整个记录添加到结果中
+                        all_lines_in_timerange.extend(record_lines)
+                        i = j + 1  # 跳过整个JSON记录
+                        continue
+                else:
+                    # 普通行，直接添加
+                    all_lines_in_timerange.append(line)
+            
+            i += 1
+        
+        return all_lines_in_timerange
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -1672,19 +2187,11 @@ class MainWindow(QMainWindow):
         self.analysis_worker.log_message_signal.connect(self.log_message)
         self.analysis_worker.start()
     
-    def display_search_result(self, keyword, results):
-        """显示搜索结果"""
-        if not results:
-            self.result_display.setPlainText(f"未找到包含关键字 '{keyword}' 的内容")
-            return
-        
-        # 显示结果
-        self.result_display.setPlainText("\n".join(results))
-        self.log_message(f"找到 {len(results)} 行包含关键字 '{keyword}'")
-    
     def display_full_log(self, log_content):
         """显示完整日志"""
+        # 直接显示完整日志，不添加前缀标记
         self.result_display.setPlainText(log_content)
+            
         lines = log_content.count('\n') + 1
         self.log_message(f"显示完整日志，共 {lines} 行")
     
@@ -1698,8 +2205,10 @@ class MainWindow(QMainWindow):
         # 获取保存文件路径
         current_item = self.log_list_widget.currentItem()
         default_name = "analysis_result.txt"
+        log_prefix = ""
         if current_item:
             file_name = current_item.text()
+            log_prefix = self._get_log_prefix(file_name)
             if "." in file_name:
                 prefix = file_name.rsplit(".", 1)[0]
                 default_name = f"{prefix}_analysis.txt"
@@ -1723,6 +2232,85 @@ class MainWindow(QMainWindow):
         """处理分析过程中的错误"""
         self.log_message(f"错误: {error_message}")
         QMessageBox.critical(self, "错误", f"操作失败：\n{error_message}")
+
+    def _get_log_prefix(self, file_name):
+        """从日志文件名中提取前缀
+        例如：'RsuLogic_2025-03-31.log' 返回 'RsuLogic'
+        """
+        import re
+        # 提取日期前的内容作为前缀
+        match = re.search(r'^(.*?)_\d{4}-\d{2}-\d{2}', file_name)
+        if match:
+            return match.group(1)
+        else:
+            # 如果没有符合格式的日期，则使用文件名前部分作为前缀
+            parts = file_name.split('.')
+            if len(parts) > 1:
+                return parts[0]
+            else:
+                return file_name
+
+    def display_search_result(self, keyword, results):
+        """显示搜索结果"""
+        if not results:
+            self.result_display.setPlainText(f"未找到包含关键字 '{keyword}' 的内容")
+            return
+        
+        # 获取日志前缀作为标记
+        log_prefix = ""
+        current_item = self.log_list_widget.currentItem()
+        if current_item:
+            log_prefix = self._get_log_prefix(current_item.text())
+        
+        # 为每行添加前缀标记，但识别JSON结构并特殊处理
+        marked_results = []
+        i = 0
+        while i < len(results):
+            line = results[i]
+            
+            # 检查是否是JSON记录的开始（包含大括号）
+            if "{" in line and not line.strip().endswith("}"):
+                # 这是JSON记录的开始行，添加前缀
+                original_indent = ""
+                if line.startswith((' ', '\t')):
+                    indent_len = len(line) - len(line.lstrip())
+                    original_indent = line[:indent_len]
+                    line = line[indent_len:]
+                
+                # 只给第一行添加前缀
+                marked_results.append(f"[{log_prefix}]{original_indent}{line}")
+                
+                # 找到整个JSON记录
+                j = i + 1
+                in_json = True
+                while j < len(results) and in_json:
+                    next_line = results[j]
+                    
+                    # 添加JSON内部行（不添加前缀）
+                    marked_results.append(next_line)
+                    
+                    # 检查是否是JSON结束行
+                    if "}" in next_line:
+                        in_json = False
+                    
+                    j += 1
+                
+                # 更新索引
+                i = j
+            else:
+                # 普通行，添加前缀
+                original_indent = ""
+                if line.startswith((' ', '\t')):
+                    indent_len = len(line) - len(line.lstrip())
+                    original_indent = line[:indent_len]
+                    line = line[indent_len:]
+                
+                marked_results.append(f"[{log_prefix}]{original_indent}{line}")
+                i += 1
+        
+        # 显示结果
+        self.result_display.setPlainText("\n".join(marked_results))
+        self.log_message(f"找到 {len(results)} 行包含关键字 '{keyword}'")
 
 def main():
     app = QApplication(sys.argv)
