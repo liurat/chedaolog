@@ -19,6 +19,7 @@ import zipfile  # 文件压缩
 from tqdm import tqdm  # 进度条显示
 import logging  # 日志记录
 import re       # 正则表达式
+import shutil   # 文件操作
 
 class LogCollector:
     """
@@ -321,6 +322,16 @@ class LogCollector:
                 self.logger.warning("没有找到符合条件的日志文件")
                 return None
 
+            # 检查是否只下载了一个zip文件
+            if len(downloaded_files) == 1 and downloaded_files[0].lower().endswith('.zip'):
+                self.logger.info(f"只下载了一个zip文件，不再进行压缩")
+                single_zip_path = os.path.join(local_dir, downloaded_files[0])
+                final_zip_path = f"{local_dir}.zip"
+                shutil.copy2(single_zip_path, final_zip_path)
+                # 删除临时目录及其内容
+                shutil.rmtree(local_dir)
+                return final_zip_path
+
             # 压缩下载的文件
             zip_path = f"{local_dir}.zip"
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
@@ -329,6 +340,10 @@ class LogCollector:
                         file_path = os.path.join(root, file)
                         arcname = os.path.relpath(file_path, local_dir)
                         zipf.write(file_path, arcname)
+
+            # 压缩完成后删除原始文件
+            shutil.rmtree(local_dir)
+            self.logger.info(f"压缩完成后删除了原始日志文件")
 
             self.logger.info(f"日志文件已压缩保存到: {zip_path}")
             return zip_path
