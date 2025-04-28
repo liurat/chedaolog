@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QSpinBox, QListWidget, QCalendarWidget, QGroupBox,
                            QCheckBox, QDateEdit, QDialog, QComboBox, QTableWidget,
                            QTableWidgetItem, QHeaderView, QDialogButtonBox, QTabWidget,
-                           QSizePolicy)
+                           QSizePolicy, QListWidgetItem, QSplitter)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QDate
 from log_collector import LogCollector
 
@@ -371,6 +371,185 @@ class HostManagerDialog(QDialog):
     def get_hosts_data(self):
         return self.hosts_data
 
+class LogAnalysisWorker(QThread):
+    log_list = pyqtSignal(list)  # 日志列表信号
+    search_result = pyqtSignal(str, list)  # 搜索结果信号，关键字和结果行列表
+    complete_log = pyqtSignal(str)  # 完整日志信号
+    error = pyqtSignal(str)  # 错误信号
+    
+    def __init__(self, config, mode='list', log_path=None, keyword=None):
+        super().__init__()
+        self.config = config
+        self.mode = mode
+        self.log_path = log_path
+        self.keyword = keyword
+        
+    def run(self):
+        try:
+            collector = LogCollector(config_file=None)
+            collector.config = self.config
+            collector.connect()
+            
+            try:
+                if self.mode == 'list':
+                    # 获取日志文件列表
+                    self.get_log_files(collector)
+                elif self.mode == 'search':
+                    # 在日志中搜索关键字
+                    self.search_keyword(collector)
+                elif self.mode == 'get_log':
+                    # 获取完整日志
+                    self.get_full_log(collector)
+            finally:
+                collector.close()
+        except Exception as e:
+            self.error.emit(str(e))
+    
+    def get_log_files(self, collector):
+        """获取日志文件列表"""
+        all_logs = []
+        
+        for path in self.config['log_paths']:
+            try:
+                # 根据系统类型选择命令
+                if collector.is_remote_windows():
+                    # Windows系统使用dir命令
+                    cmd = f'dir /b "{path}"'
+                    stdin, stdout, stderr = collector.ssh.exec_command(cmd)
+                    files = stdout.read().decode('utf-8', errors='ignore').splitlines()
+                else:
+                    # Linux系统使用ls命令
+                    cmd = f'ls -1 {path}'
+                    stdin, stdout, stderr = collector.ssh.exec_command(cmd)
+                    files = stdout.read().decode('utf-8').splitlines()
+                
+                # 过滤出支持的文件类型
+                supported_files = []
+                for file in files:
+                    file = file.strip()
+                    if collector._is_supported_file(file):
+                        # 检查日期范围
+                        if 'date_range' in self.config and self.config['date_range'].get('enabled', False):
+                            start_date = datetime.datetime.strptime(
+                                self.config['date_range']['start_date'], '%Y-%m-%d').date()
+                            end_date = datetime.datetime.strptime(
+                                self.config['date_range']['end_date'], '%Y-%m-%d').date()
+                            
+                            if collector.is_log_in_date_range(file, start_date, end_date):
+                                full_path = f"{path.rstrip('/')}/{file}"
+                                supported_files.append({
+                                    'name': file,
+                                    'path': full_path
+                                })
+                        else:
+                            full_path = f"{path.rstrip('/')}/{file}"
+                            supported_files.append({
+                                'name': file,
+                                'path': full_path
+                            })
+                
+                all_logs.extend(supported_files)
+            except Exception as e:
+                self.error.emit(f"获取目录 {path} 中的日志列表失败: {str(e)}")
+        
+        # 发送日志列表信号
+        self.log_list.emit(all_logs)
+    
+    def search_keyword(self, collector):
+        """在日志文件中搜索关键字"""
+        try:
+            if not self.log_path or not self.keyword:
+                self.error.emit("未指定日志文件或关键字")
+                return
+            
+            # 使用grep命令搜索关键字
+            if collector.is_remote_windows():
+                # Windows系统使用findstr命令
+                cmd = f'findstr /n "{self.keyword}" "{self.log_path}"'
+            else:
+                # Linux系统使用grep命令
+                cmd = f'grep -n "{self.keyword}" {self.log_path}'
+            
+            stdin, stdout, stderr = collector.ssh.exec_command(cmd)
+            results = stdout.read().decode('utf-8', errors='ignore').splitlines()
+            
+            # 解析结果，提取行号
+            parsed_results = []
+            for line in results:
+                try:
+                    # 格式为"行号:内容"
+                    parts = line.split(':', 1)
+                    if len(parts) >= 2:
+                        line_num = int(parts[0])
+                        content = parts[1]
+                        parsed_results.append({
+                            'line': line_num,
+                            'content': content
+                        })
+                except Exception as e:
+                    self.error.emit(f"解析搜索结果失败: {str(e)}")
+            
+            # 如果找到了匹配项，获取最早和最晚的行号
+            if parsed_results:
+                min_line = min(r['line'] for r in parsed_results)
+                max_line = max(r['line'] for r in parsed_results)
+                
+                # 获取这个范围内的所有行
+                if collector.is_remote_windows():
+                    # Windows使用更复杂的命令
+                    cmd = f'powershell -Command "Get-Content \'{self.log_path}\' | Select -Index ({min_line-1}..{max_line-1})"'
+                else:
+                    # Linux使用sed命令
+                    cmd = f'sed -n "{min_line},{max_line}p" {self.log_path}'
+                
+                stdin, stdout, stderr = collector.ssh.exec_command(cmd)
+                complete_results = stdout.read().decode('utf-8', errors='ignore').splitlines()
+                
+                # 发送搜索结果信号
+                self.search_result.emit(self.keyword, complete_results)
+            else:
+                self.search_result.emit(self.keyword, [])
+        except Exception as e:
+            self.error.emit(f"搜索关键字失败: {str(e)}")
+    
+    def get_full_log(self, collector):
+        """获取完整日志内容"""
+        try:
+            if not self.log_path:
+                self.error.emit("未指定日志文件")
+                return
+            
+            # 检查文件大小
+            if collector.is_remote_windows():
+                cmd = f'powershell -Command "(Get-Item \'{self.log_path}\').length"'
+            else:
+                cmd = f'stat -c %s {self.log_path}'
+            
+            stdin, stdout, stderr = collector.ssh.exec_command(cmd)
+            size_str = stdout.read().decode('utf-8', errors='ignore').strip()
+            
+            try:
+                size = int(size_str)
+                if size > 10 * 1024 * 1024:  # 大于10MB
+                    self.error.emit(f"文件太大 ({size/1024/1024:.1f}MB)，请使用关键字搜索缩小范围")
+                    return
+            except:
+                pass  # 忽略转换错误，继续尝试获取文件
+            
+            # 获取文件内容
+            if collector.is_remote_windows():
+                cmd = f'type "{self.log_path}"'
+            else:
+                cmd = f'cat {self.log_path}'
+            
+            stdin, stdout, stderr = collector.ssh.exec_command(cmd)
+            log_content = stdout.read().decode('utf-8', errors='ignore')
+            
+            # 发送完整日志信号
+            self.complete_log.emit(log_content)
+        except Exception as e:
+            self.error.emit(f"获取日志内容失败: {str(e)}")
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -555,11 +734,122 @@ class MainWindow(QMainWindow):
         analysis_tab = QWidget()
         analysis_layout = QVBoxLayout(analysis_tab)
         
-        # 添加待实现提示
-        analysis_info = QLabel("日志分析功能正在开发中，敬请期待...")
-        analysis_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        analysis_info.setStyleSheet("font-size: 16pt; color: gray;")
-        analysis_layout.addWidget(analysis_info)
+        # 创建分析选项卡的分割器
+        analysis_splitter = QSplitter(Qt.Orientation.Vertical)
+        analysis_splitter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        
+        # 上半部分：日期选择和日志列表
+        upper_widget = QWidget()
+        upper_layout = QVBoxLayout(upper_widget)
+        
+        # 创建日期范围选择（与日志收集选项卡类似）
+        date_group_analysis = QGroupBox("日期设置")
+        date_layout_analysis = QVBoxLayout(date_group_analysis)
+        
+        # 日期范围选择
+        date_range_layout_analysis = QHBoxLayout()
+        self.use_date_range_analysis = QCheckBox("使用日期范围")
+        self.use_date_range_analysis.setChecked(True)
+        date_range_layout_analysis.addWidget(self.use_date_range_analysis)
+        
+        # 开始日期
+        start_date_layout_analysis = QHBoxLayout()
+        start_date_label_analysis = QLabel("开始日期:")
+        self.start_date_analysis = QDateEdit()
+        self.start_date_analysis.setDate(QDate.currentDate().addDays(-1))  # 默认昨天
+        self.start_date_analysis.setCalendarPopup(True)
+        start_date_layout_analysis.addWidget(start_date_label_analysis)
+        start_date_layout_analysis.addWidget(self.start_date_analysis)
+        
+        # 结束日期
+        end_date_layout_analysis = QHBoxLayout()
+        end_date_label_analysis = QLabel("结束日期:")
+        self.end_date_analysis = QDateEdit()
+        self.end_date_analysis.setDate(QDate.currentDate())  # 默认今天
+        self.end_date_analysis.setCalendarPopup(True)
+        end_date_layout_analysis.addWidget(end_date_label_analysis)
+        end_date_layout_analysis.addWidget(self.end_date_analysis)
+        
+        date_range_layout_analysis.addLayout(start_date_layout_analysis)
+        date_range_layout_analysis.addLayout(end_date_layout_analysis)
+        date_layout_analysis.addLayout(date_range_layout_analysis)
+        
+        # 获取日志列表按钮
+        logs_btn_layout = QHBoxLayout()
+        get_logs_btn = QPushButton("获取日志列表")
+        get_logs_btn.clicked.connect(self.get_log_list)
+        logs_btn_layout.addWidget(get_logs_btn)
+        logs_btn_layout.addStretch(1)
+        date_layout_analysis.addLayout(logs_btn_layout)
+        
+        # 日志列表框
+        log_list_group = QGroupBox("日志文件列表")
+        log_list_layout = QVBoxLayout(log_list_group)
+        
+        self.log_list_widget = QListWidget()
+        self.log_list_widget.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        log_list_layout.addWidget(self.log_list_widget)
+        
+        # 添加到上半部分
+        upper_layout.addWidget(date_group_analysis)
+        upper_layout.addWidget(log_list_group)
+        
+        # 下半部分：关键字搜索和结果显示
+        lower_widget = QWidget()
+        lower_layout = QVBoxLayout(lower_widget)
+        
+        # 关键字搜索
+        keyword_group = QGroupBox("关键字搜索")
+        keyword_layout = QVBoxLayout(keyword_group)
+        
+        keyword_input_layout = QHBoxLayout()
+        keyword_label = QLabel("关键字:")
+        self.keyword_input = QLineEdit()
+        self.keyword_input.setPlaceholderText("输入要搜索的关键字")
+        search_btn = QPushButton("搜索")
+        search_btn.clicked.connect(self.search_keyword)
+        view_full_btn = QPushButton("查看完整日志")
+        view_full_btn.clicked.connect(self.view_full_log)
+        
+        keyword_input_layout.addWidget(keyword_label)
+        keyword_input_layout.addWidget(self.keyword_input)
+        keyword_input_layout.addWidget(search_btn)
+        keyword_input_layout.addWidget(view_full_btn)
+        
+        keyword_layout.addLayout(keyword_input_layout)
+        
+        # 搜索结果
+        result_group = QGroupBox("搜索结果")
+        result_layout = QVBoxLayout(result_group)
+        
+        self.result_display = QTextEdit()
+        self.result_display.setReadOnly(True)
+        result_layout.addWidget(self.result_display)
+        
+        # 导出按钮
+        export_layout = QHBoxLayout()
+        export_btn = QPushButton("导出结果")
+        export_btn.clicked.connect(self.export_results)
+        export_layout.addStretch(1)
+        export_layout.addWidget(export_btn)
+        result_layout.addLayout(export_layout)
+        
+        # 添加到下半部分
+        lower_layout.addWidget(keyword_group)
+        lower_layout.addWidget(result_group)
+        
+        # 将上下部分添加到分割器
+        analysis_splitter.addWidget(upper_widget)
+        analysis_splitter.addWidget(lower_widget)
+        
+        # 设置初始大小
+        analysis_splitter.setSizes([200, 400])
+        
+        # 将分割器添加到分析布局
+        analysis_layout.addWidget(analysis_splitter)
+        
+        # 更新分析选项卡
+        analysis_tab.setLayout(analysis_layout)
         
         # 添加选项卡
         self.tab_widget.addTab(collection_tab, "日志收集")
@@ -873,6 +1163,193 @@ class MainWindow(QMainWindow):
     def collection_error(self, error_message):
         self.start_button.setEnabled(True)
         self.progress_bar.setVisible(False)
+        self.log_message(f"错误: {error_message}")
+        QMessageBox.critical(self, "错误", f"操作失败：\n{error_message}")
+
+    def get_log_list(self):
+        """获取日志列表"""
+        if not self.host_input.text() or not self.username_input.text():
+            QMessageBox.warning(self, "错误", "请填写主机地址和用户名")
+            return
+        
+        if self.path_list.count() == 0:
+            QMessageBox.warning(self, "错误", "请添加至少一个日志文件路径")
+            return
+        
+        # 检查日期范围
+        start_date, end_date = self.get_date_range_analysis()
+        if start_date and end_date and start_date > end_date:
+            QMessageBox.warning(self, "错误", "开始日期不能晚于结束日期")
+            return
+        
+        # 准备配置
+        config = {
+            'ssh': {
+                'host': self.host_input.text(),
+                'port': self.port_input.value(),
+                'username': self.username_input.text(),
+                'password': self.password_input.text()
+            },
+            'log_paths': [self.path_list.item(i).text() 
+                         for i in range(self.path_list.count())],
+            'date_range': {
+                'enabled': self.use_date_range_analysis.isChecked(),
+                'start_date': start_date.strftime('%Y-%m-%d') if start_date else None,
+                'end_date': end_date.strftime('%Y-%m-%d') if end_date else None
+            }
+        }
+        
+        # 清空日志列表
+        self.log_list_widget.clear()
+        self.result_display.clear()
+        
+        # 显示加载信息
+        self.log_message("正在获取日志列表...")
+        
+        # 创建工作线程
+        self.analysis_worker = LogAnalysisWorker(config, mode='list')
+        self.analysis_worker.log_list.connect(self.display_log_list)
+        self.analysis_worker.error.connect(self.analysis_error)
+        self.analysis_worker.start()
+    
+    def get_date_range_analysis(self):
+        """获取分析选项卡的日期范围"""
+        if self.use_date_range_analysis.isChecked():
+            start_date = self.start_date_analysis.date().toPyDate()
+            end_date = self.end_date_analysis.date().toPyDate()
+            return start_date, end_date
+        return None, None
+    
+    def display_log_list(self, logs):
+        """显示日志列表"""
+        if not logs:
+            self.log_message("没有找到符合条件的日志文件")
+            return
+        
+        self.log_list_widget.clear()
+        for log in logs:
+            item = QListWidgetItem(f"{log['name']}")
+            item.setData(Qt.ItemDataRole.UserRole, log['path'])  # 存储完整路径
+            self.log_list_widget.addItem(item)
+        
+        self.log_message(f"找到 {len(logs)} 个日志文件")
+    
+    def search_keyword(self):
+        """在选中的日志中搜索关键字"""
+        current_item = self.log_list_widget.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "错误", "请先选择一个日志文件")
+            return
+        
+        keyword = self.keyword_input.text().strip()
+        if not keyword:
+            QMessageBox.warning(self, "错误", "请输入关键字")
+            return
+        
+        # 获取日志文件路径
+        log_path = current_item.data(Qt.ItemDataRole.UserRole)
+        
+        # 准备配置
+        config = {
+            'ssh': {
+                'host': self.host_input.text(),
+                'port': self.port_input.value(),
+                'username': self.username_input.text(),
+                'password': self.password_input.text()
+            }
+        }
+        
+        # 清空结果显示
+        self.result_display.clear()
+        self.log_message(f"正在 {current_item.text()} 中搜索关键字: {keyword}")
+        
+        # 创建工作线程
+        self.analysis_worker = LogAnalysisWorker(
+            config, mode='search', log_path=log_path, keyword=keyword)
+        self.analysis_worker.search_result.connect(self.display_search_result)
+        self.analysis_worker.error.connect(self.analysis_error)
+        self.analysis_worker.start()
+    
+    def view_full_log(self):
+        """查看完整日志"""
+        current_item = self.log_list_widget.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "错误", "请先选择一个日志文件")
+            return
+        
+        # 获取日志文件路径
+        log_path = current_item.data(Qt.ItemDataRole.UserRole)
+        
+        # 准备配置
+        config = {
+            'ssh': {
+                'host': self.host_input.text(),
+                'port': self.port_input.value(),
+                'username': self.username_input.text(),
+                'password': self.password_input.text()
+            }
+        }
+        
+        # 清空结果显示
+        self.result_display.clear()
+        self.log_message(f"正在获取 {current_item.text()} 的完整内容...")
+        
+        # 创建工作线程
+        self.analysis_worker = LogAnalysisWorker(
+            config, mode='get_log', log_path=log_path)
+        self.analysis_worker.complete_log.connect(self.display_full_log)
+        self.analysis_worker.error.connect(self.analysis_error)
+        self.analysis_worker.start()
+    
+    def display_search_result(self, keyword, results):
+        """显示搜索结果"""
+        if not results:
+            self.result_display.setPlainText(f"未找到包含关键字 '{keyword}' 的内容")
+            return
+        
+        # 显示结果
+        self.result_display.setPlainText("\n".join(results))
+        self.log_message(f"找到 {len(results)} 行包含关键字 '{keyword}'")
+    
+    def display_full_log(self, log_content):
+        """显示完整日志"""
+        self.result_display.setPlainText(log_content)
+        lines = log_content.count('\n') + 1
+        self.log_message(f"显示完整日志，共 {lines} 行")
+    
+    def export_results(self):
+        """导出搜索结果"""
+        content = self.result_display.toPlainText()
+        if not content:
+            QMessageBox.warning(self, "错误", "没有可导出的内容")
+            return
+        
+        # 获取保存文件路径
+        current_item = self.log_list_widget.currentItem()
+        default_name = "analysis_result.txt"
+        if current_item:
+            file_name = current_item.text()
+            if "." in file_name:
+                prefix = file_name.rsplit(".", 1)[0]
+                default_name = f"{prefix}_analysis.txt"
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "导出结果", default_name, "文本文件 (*.txt)")
+        
+        if not file_path:
+            return  # 用户取消了保存
+        
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            self.log_message(f"结果已保存到 {file_path}")
+            QMessageBox.information(self, "成功", f"结果已保存到:\n{file_path}")
+        except Exception as e:
+            self.log_message(f"保存结果失败: {str(e)}")
+            QMessageBox.critical(self, "错误", f"保存结果失败:\n{str(e)}")
+    
+    def analysis_error(self, error_message):
+        """处理分析过程中的错误"""
         self.log_message(f"错误: {error_message}")
         QMessageBox.critical(self, "错误", f"操作失败：\n{error_message}")
 
