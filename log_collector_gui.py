@@ -10,7 +10,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QTextEdit, QFileDialog, QProgressBar, QMessageBox,
                            QSpinBox, QListWidget, QCalendarWidget, QGroupBox,
                            QCheckBox, QDateEdit, QDialog, QComboBox, QTableWidget,
-                           QTableWidgetItem, QHeaderView, QDialogButtonBox)
+                           QTableWidgetItem, QHeaderView, QDialogButtonBox, QTabWidget,
+                           QSizePolicy)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QDate
 from log_collector import LogCollector
 
@@ -351,7 +352,7 @@ class HostManagerDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("车道系统日志收集工具")
+        self.setWindowTitle("车道系统日志收集分析工具")
         self.setMinimumSize(800, 600)
         
         # 主机配置数据
@@ -360,7 +361,7 @@ class MainWindow(QMainWindow):
         # 创建主窗口部件
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
-        layout = QVBoxLayout(main_widget)
+        main_layout = QVBoxLayout(main_widget)
         
         # 主机选择区域
         host_select_group = QGroupBox("主机选择")
@@ -412,6 +413,14 @@ class MainWindow(QMainWindow):
         
         ssh_layout.addLayout(host_layout)
         ssh_layout.addLayout(credentials_layout)
+        
+        # 创建选项卡窗口
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        
+        # 创建日志收集选项卡
+        collection_tab = QWidget()
+        collection_layout = QVBoxLayout(collection_tab)
         
         # 日期选择
         date_group = QGroupBox("日期设置")
@@ -496,14 +505,38 @@ class MainWindow(QMainWindow):
         button_layout.addWidget(list_files_btn)
         button_layout.addWidget(self.start_button)
         
+        # 将组件添加到日志收集选项卡
+        collection_layout.addWidget(date_group)
+        collection_layout.addWidget(path_group)
+        collection_layout.addWidget(self.progress_bar)
+        collection_layout.addWidget(log_group)
+        collection_layout.addLayout(button_layout)
+        
+        # 创建日志分析选项卡
+        analysis_tab = QWidget()
+        analysis_layout = QVBoxLayout(analysis_tab)
+        
+        # 添加待实现提示
+        analysis_info = QLabel("日志分析功能正在开发中，敬请期待...")
+        analysis_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        analysis_info.setStyleSheet("font-size: 16pt; color: gray;")
+        analysis_layout.addWidget(analysis_info)
+        
+        # 添加选项卡
+        self.tab_widget.addTab(collection_tab, "日志收集")
+        self.tab_widget.addTab(analysis_tab, "日志分析")
+        
         # 添加所有组件到主布局
-        layout.addWidget(host_select_group)
-        layout.addWidget(ssh_group)
-        layout.addWidget(date_group)
-        layout.addWidget(path_group)
-        layout.addWidget(self.progress_bar)
-        layout.addWidget(log_group)
-        layout.addLayout(button_layout)
+        main_layout.addWidget(host_select_group)
+        main_layout.addWidget(ssh_group)
+        main_layout.addWidget(self.tab_widget)
+        
+        # 设置所有组件为自适应大小
+        host_select_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        ssh_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        date_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        path_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        log_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         
         # 加载配置
         self.load_config()
