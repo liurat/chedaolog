@@ -45,7 +45,12 @@ class LogCollectorWorker(QThread):
                                 # Windows系统使用dir命令
                                 cmd = f'dir /O-D "{path}"'
                                 stdin, stdout, stderr = collector.ssh.exec_command(cmd)
-                                files = stdout.read().decode('utf-8', errors='ignore').splitlines()
+                                try:
+                                    files = stdout.read().decode('gbk').splitlines()
+                                except UnicodeDecodeError:
+                                    # 如果读取失败，重新执行命令
+                                    stdin, stdout, stderr = collector.ssh.exec_command(cmd)
+                                    files = stdout.read().decode('utf-8', errors='ignore').splitlines()
                                 
                                 # 跳过Windows dir命令的头部信息
                                 start_idx = 0
@@ -81,7 +86,10 @@ class LogCollectorWorker(QThread):
                                 # Linux系统使用ls命令
                                 cmd = f'ls -lt {path} | head -n 11'  # 11是因为第一行是total
                                 stdin, stdout, stderr = collector.ssh.exec_command(cmd)
-                                files = stdout.read().decode('utf-8').splitlines()
+                                try:
+                                    files = stdout.read().decode('utf-8').splitlines()
+                                except UnicodeDecodeError:
+                                    files = stdout.read().decode('gbk', errors='ignore').splitlines()
                                 
                                 # 移除第一行的total
                                 if files and files[0].startswith('total'):
@@ -376,6 +384,7 @@ class LogAnalysisWorker(QThread):
     search_result = pyqtSignal(str, list)  # 搜索结果信号，关键字和结果行列表
     complete_log = pyqtSignal(str)  # 完整日志信号
     error = pyqtSignal(str)  # 错误信号
+    log_message_signal = pyqtSignal(str)  # 添加日志消息信号
     
     def __init__(self, config, mode='list', log_path=None, keyword=None):
         super().__init__()
@@ -383,6 +392,10 @@ class LogAnalysisWorker(QThread):
         self.mode = mode
         self.log_path = log_path
         self.keyword = keyword
+    
+    def log_message(self, message):
+        """发送普通日志消息"""
+        self.log_message_signal.emit(message)
         
     def run(self):
         try:
@@ -414,25 +427,64 @@ class LogAnalysisWorker(QThread):
                 # 根据系统类型选择命令
                 if collector.is_remote_windows():
                     # Windows系统使用dir命令
-                    cmd = f'dir /b "{path}"'
+                    cmd = f'dir /O-D "{path}"'
                     stdin, stdout, stderr = collector.ssh.exec_command(cmd)
-                    files = stdout.read().decode('utf-8', errors='ignore').splitlines()
+                    try:
+                        files = stdout.read().decode('gbk').splitlines()
+                    except UnicodeDecodeError:
+                        # 如果读取失败，重新执行命令
+                        stdin, stdout, stderr = collector.ssh.exec_command(cmd)
+                        files = stdout.read().decode('utf-8', errors='ignore').splitlines()
+                    
+                    # 跳过Windows dir命令的头部信息
+                    start_idx = 0
+                    for i, line in enumerate(files):
+                        if "Directory of" in line:
+                            start_idx = i + 2
+                            break
+                    
+                    files = files[start_idx:]
+                    
+                    # 解析文件信息
+                    file_info_list = []
+                    for line in files:
+                        if not line.strip() or "<DIR>" in line:
+                            continue
+                        
+                        parts = line.strip().split()
+                        if len(parts) >= 4:
+                            # Windows dir命令格式: 日期 时间 大小 文件名
+                            try:
+                                date_str = parts[0]
+                                time_str = parts[1]
+                                # 文件名可能包含空格，所以要合并后面的所有部分
+                                filename = ' '.join(parts[3:])
+                                file_info_list.append({
+                                    'name': filename,
+                                    'date': f"{date_str} {time_str}",
+                                    'path': path
+                                })
+                            except:
+                                continue
                 else:
                     # Linux系统使用ls命令
                     cmd = f'ls -1 {path}'
                     stdin, stdout, stderr = collector.ssh.exec_command(cmd)
-                    files = stdout.read().decode('utf-8').splitlines()
+                    try:
+                        files = stdout.read().decode('utf-8').splitlines()
+                    except UnicodeDecodeError:
+                        files = stdout.read().decode('gbk', errors='ignore').splitlines()
                 
                 # 过滤出支持的文件类型
                 supported_files = []
                 for file in files:
                     file = file.strip()
-                    if collector._is_supported_file(file):
+                    if collector.is_supported_file(file):
                         # 检查日期范围
                         if 'date_range' in self.config and self.config['date_range'].get('enabled', False):
-                            start_date = datetime.datetime.strptime(
+                            start_date = datetime.strptime(
                                 self.config['date_range']['start_date'], '%Y-%m-%d').date()
-                            end_date = datetime.datetime.strptime(
+                            end_date = datetime.strptime(
                                 self.config['date_range']['end_date'], '%Y-%m-%d').date()
                             
                             if collector.is_log_in_date_range(file, start_date, end_date):
@@ -462,16 +514,83 @@ class LogAnalysisWorker(QThread):
                 self.error.emit("未指定日志文件或关键字")
                 return
             
+            self.log_message(f"准备搜索关键字: '{self.keyword}'")
+            
+            # 使用缓存管理
+            file_name = os.path.basename(self.log_path)
+            cache_file = self._get_cached_file(self.log_path, collector)
+            
+            # 在本地文件中搜索
+            found_lines = []
+            line_numbers = []
+            
+            try:
+                # 尝试多种编码打开文件
+                file_content = self._read_file_with_encoding(cache_file)
+                
+                # 搜索关键字
+                for i, line in enumerate(file_content, 1):
+                    if self.keyword in line:
+                        found_lines.append(line.strip())
+                        line_numbers.append(i)
+                
+                # 检查结果
+                if found_lines:
+                    self.log_message(f"找到 {len(found_lines)} 个匹配项")
+                    self.search_result.emit(self.keyword, found_lines)
+                    return
+                else:
+                    self.log_message("搜索未找到匹配结果")
+                    self.search_result.emit(self.keyword, [])
+                    return
+            except Exception as e:
+                self.error.emit(f"本地搜索方法失败: {str(e)}")
+                # 如果本地搜索失败，继续尝试远程搜索方法
+            
+            # 以下是原来的远程搜索方法（作为备用）
             # 使用grep命令搜索关键字
             if collector.is_remote_windows():
                 # Windows系统使用findstr命令
                 cmd = f'findstr /n "{self.keyword}" "{self.log_path}"'
+                if not self.keyword.isascii():  # 如果是非ASCII字符(如中文)
+                    # 对于Windows系统中文搜索，使用type配合findstr
+                    cmd = f'type "{self.log_path}" | findstr /n "{self.keyword}"'
             else:
-                # Linux系统使用grep命令
-                cmd = f'grep -n "{self.keyword}" {self.log_path}'
+                # Linux系统使用grep命令，添加字符集支持
+                if not self.keyword.isascii():  # 如果是非ASCII字符(如中文)
+                    # 尝试多种字符集编码
+                    encoding_options = ["--binary-files=text", "--text"]
+                    # 添加LC_ALL=zh_CN.UTF-8环境变量以支持中文
+                    cmd = f'export LC_ALL=zh_CN.UTF-8 || export LC_ALL=C.UTF-8; grep -n {" ".join(encoding_options)} "{self.keyword}" {self.log_path}'
+                else:
+                    cmd = f'grep -n "{self.keyword}" {self.log_path}'
+            
+            self.log_message(f"执行搜索命令: {cmd}")
             
             stdin, stdout, stderr = collector.ssh.exec_command(cmd)
-            results = stdout.read().decode('utf-8', errors='ignore').splitlines()
+            stdout_data = stdout.read()
+            stderr_data = stderr.read()
+            
+            if stderr_data:
+                self.error.emit(f"搜索错误: {stderr_data.decode('utf-8', errors='ignore')}")
+                
+                # 如果第一次尝试失败且是中文关键字，再尝试一次其他方法
+                if not self.keyword.isascii() and not collector.is_remote_windows():
+                    self.log_message("尝试使用备用方法搜索中文关键字...")
+                    # 使用grep -P (Perl正则模式)搜索
+                    cmd2 = f'export LC_ALL=C.UTF-8; grep -P -n "{self.keyword}" {self.log_path} || grep -a -n "{self.keyword}" {self.log_path}'
+                    self.log_message(f"执行备用搜索命令: {cmd2}")
+                    stdin, stdout, stderr = collector.ssh.exec_command(cmd2)
+                    stdout_data = stdout.read()
+            
+            # 尝试多种编码格式
+            try:
+                results = stdout_data.decode('gbk').splitlines()
+            except UnicodeDecodeError:
+                try:
+                    results = stdout_data.decode('utf-8').splitlines()
+                except UnicodeDecodeError:
+                    results = stdout_data.decode('utf-8', errors='ignore').splitlines()
             
             # 解析结果，提取行号
             parsed_results = []
@@ -487,7 +606,7 @@ class LogAnalysisWorker(QThread):
                             'content': content
                         })
                 except Exception as e:
-                    self.error.emit(f"解析搜索结果失败: {str(e)}")
+                    self.error.emit(f"解析搜索结果失败: {str(e)}, 行内容: {line}")
             
             # 如果找到了匹配项，获取最早和最晚的行号
             if parsed_results:
@@ -496,19 +615,60 @@ class LogAnalysisWorker(QThread):
                 
                 # 获取这个范围内的所有行
                 if collector.is_remote_windows():
-                    # Windows使用更复杂的命令
-                    cmd = f'powershell -Command "Get-Content \'{self.log_path}\' | Select -Index ({min_line-1}..{max_line-1})"'
+                    # Windows使用更简单的命令，避免PowerShell复杂性
+                    line_range = max_line - min_line + 1
+                    cmd = f'more +{min_line-1} "{self.log_path}" | findstr /n "^" | findstr /b "[1-{line_range}]:"'
                 else:
                     # Linux使用sed命令
                     cmd = f'sed -n "{min_line},{max_line}p" {self.log_path}'
                 
                 stdin, stdout, stderr = collector.ssh.exec_command(cmd)
-                complete_results = stdout.read().decode('utf-8', errors='ignore').splitlines()
+                stdout_data = stdout.read()
+                stderr_data = stderr.read()
+                
+                if stderr_data:
+                    self.error.emit(f"获取内容错误: {stderr_data.decode('utf-8', errors='ignore')}")
+                
+                # 尝试多种编码格式
+                try:
+                    complete_results = stdout_data.decode('gbk').splitlines()
+                except UnicodeDecodeError:
+                    try:
+                        complete_results = stdout_data.decode('utf-8').splitlines()
+                    except UnicodeDecodeError:
+                        complete_results = stdout_data.decode('utf-8', errors='ignore').splitlines()
+                
+                # 去除行号前缀
+                processed_results = []
+                for line in complete_results:
+                    parts = line.split(':', 1)
+                    if len(parts) >= 2:
+                        processed_results.append(parts[1])
+                    else:
+                        processed_results.append(line)
                 
                 # 发送搜索结果信号
-                self.search_result.emit(self.keyword, complete_results)
+                self.search_result.emit(self.keyword, processed_results)
             else:
+                # 如果使用第一种方法没找到，尝试使用strings命令过滤二进制文件然后grep
+                if not self.keyword.isascii() and not collector.is_remote_windows():
+                    self.log_message("尝试使用strings命令搜索二进制文件...")
+                    cmd3 = f'strings "{self.log_path}" | grep -n "{self.keyword}"'
+                    self.log_message(f"执行strings搜索命令: {cmd3}")
+                    stdin, stdout, stderr = collector.ssh.exec_command(cmd3)
+                    stdout_data = stdout.read()
+                    
+                    if stdout_data:
+                        try:
+                            results = stdout_data.decode('utf-8', errors='ignore').splitlines()
+                            if results:
+                                self.search_result.emit(self.keyword, results)
+                                return
+                        except:
+                            pass
+                
                 self.search_result.emit(self.keyword, [])
+                self.log_message(f"未找到包含关键字 '{self.keyword}' 的内容")
         except Exception as e:
             self.error.emit(f"搜索关键字失败: {str(e)}")
     
@@ -536,19 +696,130 @@ class LogAnalysisWorker(QThread):
             except:
                 pass  # 忽略转换错误，继续尝试获取文件
             
+            # 使用缓存管理
+            cache_file = self._get_cached_file(self.log_path, collector)
+            
+            # 读取文件内容
+            try:
+                log_content = self._read_file_content(cache_file)
+                
+                # 发送完整日志信号
+                self.complete_log.emit(log_content)
+                return
+            except Exception as e:
+                self.error.emit(f"本地文件读取失败: {str(e)}")
+                # 如果本地下载失败，继续尝试远程读取方法
+            
+            # 以下是原来的远程获取方法（作为备用）
             # 获取文件内容
             if collector.is_remote_windows():
+                # 对于Windows系统，确保使用正确的命令和编码
                 cmd = f'type "{self.log_path}"'
             else:
                 cmd = f'cat {self.log_path}'
             
             stdin, stdout, stderr = collector.ssh.exec_command(cmd)
-            log_content = stdout.read().decode('utf-8', errors='ignore')
+            stdout_data = stdout.read()
+            stderr_data = stderr.read()
+            
+            if stderr_data:
+                self.error.emit(f"获取日志内容错误: {stderr_data.decode('utf-8', errors='ignore')}")
+            
+            # 优先尝试GBK编码（中文Windows系统常用）
+            try:
+                log_content = stdout_data.decode('gbk')
+            except UnicodeDecodeError:
+                try:
+                    # 如果GBK失败，尝试UTF-8
+                    log_content = stdout_data.decode('utf-8')
+                except UnicodeDecodeError:
+                    # 最后使用带错误忽略的UTF-8
+                    log_content = stdout_data.decode('utf-8', errors='ignore')
+                    self.error.emit("警告：日志内容编码不匹配，可能有乱码")
             
             # 发送完整日志信号
             self.complete_log.emit(log_content)
         except Exception as e:
             self.error.emit(f"获取日志内容失败: {str(e)}")
+    
+    def _get_cached_file(self, remote_path, collector):
+        """获取缓存的文件，如果缓存不存在则下载"""
+        # 确保缓存目录存在
+        import tempfile
+        import hashlib
+        
+        # 创建缓存目录
+        cache_dir = os.path.join(tempfile.gettempdir(), "log_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # 计算缓存文件名（使用远程路径的哈希作为文件名）
+        file_hash = hashlib.md5(remote_path.encode()).hexdigest()
+        file_name = os.path.basename(remote_path)
+        cache_file = os.path.join(cache_dir, f"{file_hash}_{file_name}")
+        
+        # 如果缓存不存在，则下载
+        if not os.path.exists(cache_file):
+            self.log_message(f"缓存不存在，下载文件: {remote_path}")
+            collector.sftp.get(remote_path, cache_file)
+            self.log_message(f"文件已下载到缓存: {cache_file}")
+        else:
+            self.log_message(f"使用缓存文件: {cache_file}")
+        
+        return cache_file
+    
+    def _read_file_with_encoding(self, file_path):
+        """尝试多种编码读取文件为行列表"""
+        # 尝试多种编码打开文件
+        encodings = ['gbk', 'utf-8', 'gb18030', 'latin1']
+        file_content = None
+        
+        for encoding in encodings:
+            try:
+                with open(file_path, 'r', encoding=encoding) as f:
+                    file_content = f.readlines()
+                self.log_message(f"成功使用编码 {encoding} 打开文件")
+                break
+            except UnicodeDecodeError:
+                continue
+        
+        if not file_content:
+            # 如果所有编码都失败，使用二进制模式读取并手动处理
+            with open(file_path, 'rb') as f:
+                binary_content = f.read()
+                try:
+                    file_content = binary_content.decode('gbk', errors='ignore').splitlines(True)
+                except:
+                    file_content = binary_content.decode('utf-8', errors='ignore').splitlines(True)
+            self.log_message("使用二进制模式读取文件并手动解码")
+        
+        return file_content
+    
+    def _read_file_content(self, file_path):
+        """尝试多种编码读取文件为字符串"""
+        # 尝试多种编码打开文件
+        encodings = ['gbk', 'utf-8', 'gb18030', 'latin1']
+        file_content = None
+        
+        for encoding in encodings:
+            try:
+                with open(file_path, 'r', encoding=encoding) as f:
+                    file_content = f.read()
+                self.log_message(f"成功使用编码 {encoding} 打开文件")
+                break
+            except UnicodeDecodeError:
+                continue
+        
+        if not file_content:
+            # 如果所有编码都失败，使用二进制模式读取并手动处理
+            with open(file_path, 'rb') as f:
+                binary_content = f.read()
+                try:
+                    file_content = binary_content.decode('gbk', errors='ignore')
+                except:
+                    file_content = binary_content.decode('utf-8', errors='ignore')
+            self.log_message("使用二进制模式读取文件并手动解码")
+        
+        return file_content
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -734,15 +1005,20 @@ class MainWindow(QMainWindow):
         analysis_tab = QWidget()
         analysis_layout = QVBoxLayout(analysis_tab)
         
-        # 创建分析选项卡的分割器
-        analysis_splitter = QSplitter(Qt.Orientation.Vertical)
-        analysis_splitter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        # 创建分析选项卡的主分割器（上下布局）
+        main_splitter = QSplitter(Qt.Orientation.Vertical)
+        main_splitter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         
-        # 上半部分：日期选择和日志列表
+        # 上半部分：日期选择和日志列表（并列布局）
         upper_widget = QWidget()
-        upper_layout = QVBoxLayout(upper_widget)
+        upper_layout = QHBoxLayout(upper_widget)  # 改为水平布局
         
-        # 创建日期范围选择（与日志收集选项卡类似）
+        # 左侧：日期设置部分
+        date_container = QWidget()
+        date_container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        date_container_layout = QVBoxLayout(date_container)
+        
+        # 创建日期范围选择
         date_group_analysis = QGroupBox("日期设置")
         date_layout_analysis = QVBoxLayout(date_group_analysis)
         
@@ -782,25 +1058,36 @@ class MainWindow(QMainWindow):
         logs_btn_layout.addStretch(1)
         date_layout_analysis.addLayout(logs_btn_layout)
         
-        # 日志列表框
+        date_container_layout.addWidget(date_group_analysis)
+        date_container_layout.addStretch(1)  # 添加弹性空间，使日期控件在顶部
+        
+        # 右侧：日志列表框
+        log_list_container = QWidget()
+        log_list_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        log_list_layout = QVBoxLayout(log_list_container)
+        
         log_list_group = QGroupBox("日志文件列表")
-        log_list_layout = QVBoxLayout(log_list_group)
+        log_list_inner_layout = QVBoxLayout(log_list_group)
         
         self.log_list_widget = QListWidget()
         self.log_list_widget.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
-        log_list_layout.addWidget(self.log_list_widget)
+        log_list_inner_layout.addWidget(self.log_list_widget)
         
-        # 添加到上半部分
-        upper_layout.addWidget(date_group_analysis)
-        upper_layout.addWidget(log_list_group)
+        log_list_layout.addWidget(log_list_group)
         
-        # 下半部分：关键字搜索和结果显示
-        lower_widget = QWidget()
-        lower_layout = QVBoxLayout(lower_widget)
+        # 将左右两部分添加到上半部分布局
+        upper_layout.addWidget(date_container, 1)  # 1是拉伸因子
+        upper_layout.addWidget(log_list_container, 3)  # 日志列表占更多空间
+        
+        # 中间部分：关键字搜索
+        middle_widget = QWidget()
+        middle_layout = QVBoxLayout(middle_widget)
+        middle_layout.setContentsMargins(0, 0, 0, 0)  # 减小边距
         
         # 关键字搜索
         keyword_group = QGroupBox("关键字搜索")
         keyword_layout = QVBoxLayout(keyword_group)
+        keyword_layout.setContentsMargins(9, 9, 9, 9)  # 减小内边距
         
         keyword_input_layout = QHBoxLayout()
         keyword_label = QLabel("关键字:")
@@ -817,8 +1104,13 @@ class MainWindow(QMainWindow):
         keyword_input_layout.addWidget(view_full_btn)
         
         keyword_layout.addLayout(keyword_input_layout)
+        middle_layout.addWidget(keyword_group)
         
-        # 搜索结果
+        # 下半部分：搜索结果和操作日志（并列布局）
+        lower_widget = QWidget()
+        lower_layout = QHBoxLayout(lower_widget)  # 水平布局
+        
+        # 左侧：搜索结果
         result_group = QGroupBox("搜索结果")
         result_layout = QVBoxLayout(result_group)
         
@@ -834,19 +1126,29 @@ class MainWindow(QMainWindow):
         export_layout.addWidget(export_btn)
         result_layout.addLayout(export_layout)
         
-        # 添加到下半部分
-        lower_layout.addWidget(keyword_group)
-        lower_layout.addWidget(result_group)
+        # 右侧：操作日志记录
+        analysis_log_group = QGroupBox("操作日志")
+        analysis_log_layout = QVBoxLayout(analysis_log_group)
+        analysis_log_layout.setContentsMargins(9, 9, 9, 9)  # 减小内边距
         
-        # 将上下部分添加到分割器
-        analysis_splitter.addWidget(upper_widget)
-        analysis_splitter.addWidget(lower_widget)
+        self.analysis_log_display = QTextEdit()
+        self.analysis_log_display.setReadOnly(True)
+        analysis_log_layout.addWidget(self.analysis_log_display)
         
-        # 设置初始大小
-        analysis_splitter.setSizes([200, 400])
+        # 添加到下半部分布局
+        lower_layout.addWidget(result_group, 3)  # 搜索结果占更多空间
+        lower_layout.addWidget(analysis_log_group, 1)
         
-        # 将分割器添加到分析布局
-        analysis_layout.addWidget(analysis_splitter)
+        # 将所有部分添加到主分割器
+        main_splitter.addWidget(upper_widget)
+        main_splitter.addWidget(middle_widget)
+        main_splitter.addWidget(lower_widget)
+        
+        # 设置初始大小比例
+        main_splitter.setSizes([300, 80, 400])  # 上半部分更大，中间部分更小
+        
+        # 将主分割器添加到分析布局
+        analysis_layout.addWidget(main_splitter)
         
         # 更新分析选项卡
         analysis_tab.setLayout(analysis_layout)
@@ -1033,7 +1335,14 @@ class MainWindow(QMainWindow):
             self.path_list.takeItem(self.path_list.row(current_item))
     
     def log_message(self, message):
-        self.log_display.append(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {message}")
+        """添加日志消息到日志显示框"""
+        time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        formatted_message = f"{time_str} {message}"
+        # 添加到日志收集选项卡的日志显示框
+        self.log_display.append(formatted_message)
+        # 添加到日志分析选项卡的日志显示框（如果已创建）
+        if hasattr(self, 'analysis_log_display'):
+            self.analysis_log_display.append(formatted_message)
     
     def get_date_range(self):
         if self.use_date_range.isChecked():
@@ -1210,6 +1519,7 @@ class MainWindow(QMainWindow):
         self.analysis_worker = LogAnalysisWorker(config, mode='list')
         self.analysis_worker.log_list.connect(self.display_log_list)
         self.analysis_worker.error.connect(self.analysis_error)
+        self.analysis_worker.log_message_signal.connect(self.log_message)
         self.analysis_worker.start()
     
     def get_date_range_analysis(self):
@@ -1268,6 +1578,7 @@ class MainWindow(QMainWindow):
             config, mode='search', log_path=log_path, keyword=keyword)
         self.analysis_worker.search_result.connect(self.display_search_result)
         self.analysis_worker.error.connect(self.analysis_error)
+        self.analysis_worker.log_message_signal.connect(self.log_message)
         self.analysis_worker.start()
     
     def view_full_log(self):
@@ -1299,6 +1610,7 @@ class MainWindow(QMainWindow):
             config, mode='get_log', log_path=log_path)
         self.analysis_worker.complete_log.connect(self.display_full_log)
         self.analysis_worker.error.connect(self.analysis_error)
+        self.analysis_worker.log_message_signal.connect(self.log_message)
         self.analysis_worker.start()
     
     def display_search_result(self, keyword, results):
