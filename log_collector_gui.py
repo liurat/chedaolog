@@ -9,7 +9,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QHBoxLayout, QLabel, QLineEdit, QPushButton,
                            QTextEdit, QFileDialog, QProgressBar, QMessageBox,
                            QSpinBox, QListWidget, QCalendarWidget, QGroupBox,
-                           QCheckBox, QDateEdit, QDialog)
+                           QCheckBox, QDateEdit, QDialog, QComboBox, QTableWidget,
+                           QTableWidgetItem, QHeaderView, QDialogButtonBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QDate
 from log_collector import LogCollector
 
@@ -151,16 +152,233 @@ class PathInputDialog(QDialog):
     def get_path(self):
         return self.path_input.text().strip()
 
+class HostInputDialog(QDialog):
+    def __init__(self, parent=None, host_data=None):
+        super().__init__(parent)
+        self.setWindowTitle("添加/编辑主机信息")
+        self.setMinimumWidth(500)
+        
+        layout = QVBoxLayout(self)
+        
+        # 主机名称
+        name_layout = QHBoxLayout()
+        name_label = QLabel("主机名称:")
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("例如: 生产服务器")
+        name_layout.addWidget(name_label)
+        name_layout.addWidget(self.name_input)
+        layout.addLayout(name_layout)
+        
+        # SSH连接信息
+        ssh_group = QGroupBox("SSH连接设置")
+        ssh_layout = QVBoxLayout(ssh_group)
+        
+        # 主机地址
+        host_layout = QHBoxLayout()
+        host_label = QLabel("主机地址:")
+        self.host_input = QLineEdit()
+        self.host_input.setPlaceholderText("例如: 192.168.1.100")
+        port_label = QLabel("端口:")
+        self.port_input = QSpinBox()
+        self.port_input.setRange(1, 65535)
+        self.port_input.setValue(22)
+        host_layout.addWidget(host_label)
+        host_layout.addWidget(self.host_input)
+        host_layout.addWidget(port_label)
+        host_layout.addWidget(self.port_input)
+        ssh_layout.addLayout(host_layout)
+        
+        # 用户名密码
+        credentials_layout = QHBoxLayout()
+        username_label = QLabel("用户名:")
+        self.username_input = QLineEdit()
+        password_label = QLabel("密码:")
+        self.password_input = QLineEdit()
+        self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        credentials_layout.addWidget(username_label)
+        credentials_layout.addWidget(self.username_input)
+        credentials_layout.addWidget(password_label)
+        credentials_layout.addWidget(self.password_input)
+        ssh_layout.addLayout(credentials_layout)
+        
+        layout.addWidget(ssh_group)
+        
+        # 日志路径列表
+        path_group = QGroupBox("日志文件路径")
+        path_layout = QVBoxLayout(path_group)
+        
+        self.path_list = QListWidget()
+        self.path_list.setMinimumHeight(100)
+        
+        # 路径操作按钮
+        path_buttons = QHBoxLayout()
+        add_path_btn = QPushButton("添加目录")
+        remove_path_btn = QPushButton("删除选中")
+        path_buttons.addWidget(add_path_btn)
+        path_buttons.addWidget(remove_path_btn)
+        
+        path_layout.addWidget(self.path_list)
+        path_layout.addLayout(path_buttons)
+        
+        # 连接按钮事件
+        add_path_btn.clicked.connect(self.add_path)
+        remove_path_btn.clicked.connect(self.remove_path)
+        
+        layout.addWidget(path_group)
+        
+        # 添加确定取消按钮
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+        
+        # 如果有主机数据，填充表单
+        if host_data:
+            self.name_input.setText(host_data.get("name", ""))
+            self.host_input.setText(host_data.get("ssh", {}).get("host", ""))
+            self.port_input.setValue(host_data.get("ssh", {}).get("port", 22))
+            self.username_input.setText(host_data.get("ssh", {}).get("username", ""))
+            self.password_input.setText(host_data.get("ssh", {}).get("password", ""))
+            
+            for path in host_data.get("log_paths", []):
+                self.path_list.addItem(path)
+    
+    def add_path(self):
+        dialog = PathInputDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            path = dialog.get_path()
+            if path:
+                self.path_list.addItem(path)
+    
+    def remove_path(self):
+        current_item = self.path_list.currentItem()
+        if current_item:
+            self.path_list.takeItem(self.path_list.row(current_item))
+    
+    def get_host_data(self):
+        return {
+            "name": self.name_input.text(),
+            "ssh": {
+                "host": self.host_input.text(),
+                "port": self.port_input.value(),
+                "username": self.username_input.text(),
+                "password": self.password_input.text()
+            },
+            "log_paths": [self.path_list.item(i).text() 
+                         for i in range(self.path_list.count())]
+        }
+
+class HostManagerDialog(QDialog):
+    def __init__(self, parent=None, hosts_data=None):
+        super().__init__(parent)
+        self.setWindowTitle("主机管理")
+        self.setMinimumSize(700, 400)
+        
+        self.hosts_data = hosts_data or []
+        
+        layout = QVBoxLayout(self)
+        
+        # 主机列表表格
+        self.hosts_table = QTableWidget()
+        self.hosts_table.setColumnCount(4)
+        self.hosts_table.setHorizontalHeaderLabels(["主机名称", "主机地址", "用户名", "日志路径数"])
+        self.hosts_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        
+        layout.addWidget(self.hosts_table)
+        
+        # 操作按钮
+        button_layout = QHBoxLayout()
+        add_host_btn = QPushButton("添加主机")
+        edit_host_btn = QPushButton("编辑主机")
+        delete_host_btn = QPushButton("删除主机")
+        button_layout.addWidget(add_host_btn)
+        button_layout.addWidget(edit_host_btn)
+        button_layout.addWidget(delete_host_btn)
+        
+        # 确定取消按钮
+        close_btn = QPushButton("关闭")
+        button_layout.addWidget(close_btn)
+        
+        layout.addLayout(button_layout)
+        
+        # 连接信号
+        add_host_btn.clicked.connect(self.add_host)
+        edit_host_btn.clicked.connect(self.edit_host)
+        delete_host_btn.clicked.connect(self.delete_host)
+        close_btn.clicked.connect(self.accept)
+        
+        # 加载主机数据
+        self.load_hosts()
+    
+    def load_hosts(self):
+        self.hosts_table.setRowCount(len(self.hosts_data))
+        
+        for row, host in enumerate(self.hosts_data):
+            self.hosts_table.setItem(row, 0, QTableWidgetItem(host.get("name", "")))
+            self.hosts_table.setItem(row, 1, QTableWidgetItem(host.get("ssh", {}).get("host", "")))
+            self.hosts_table.setItem(row, 2, QTableWidgetItem(host.get("ssh", {}).get("username", "")))
+            self.hosts_table.setItem(row, 3, QTableWidgetItem(str(len(host.get("log_paths", [])))))
+    
+    def add_host(self):
+        dialog = HostInputDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            host_data = dialog.get_host_data()
+            self.hosts_data.append(host_data)
+            self.load_hosts()
+    
+    def edit_host(self):
+        current_row = self.hosts_table.currentRow()
+        if current_row >= 0 and current_row < len(self.hosts_data):
+            dialog = HostInputDialog(self, self.hosts_data[current_row])
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self.hosts_data[current_row] = dialog.get_host_data()
+                self.load_hosts()
+    
+    def delete_host(self):
+        current_row = self.hosts_table.currentRow()
+        if current_row >= 0 and current_row < len(self.hosts_data):
+            host_name = self.hosts_data[current_row].get("name", "")
+            reply = QMessageBox.question(self, "确认删除", 
+                                       f"确定要删除主机 '{host_name}' 吗？",
+                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                del self.hosts_data[current_row]
+                self.load_hosts()
+    
+    def get_hosts_data(self):
+        return self.hosts_data
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("车道系统日志收集工具")
         self.setMinimumSize(800, 600)
         
+        # 主机配置数据
+        self.hosts_data = []
+        
         # 创建主窗口部件
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout(main_widget)
+        
+        # 主机选择区域
+        host_select_group = QGroupBox("主机选择")
+        host_select_layout = QHBoxLayout(host_select_group)
+        
+        host_label = QLabel("选择主机:")
+        self.host_combo = QComboBox()
+        self.host_combo.setMinimumWidth(200)
+        manage_hosts_btn = QPushButton("管理主机")
+        
+        host_select_layout.addWidget(host_label)
+        host_select_layout.addWidget(self.host_combo)
+        host_select_layout.addWidget(manage_hosts_btn)
+        host_select_layout.addStretch(1)
+        
+        # 连接主机选择变化信号
+        self.host_combo.currentIndexChanged.connect(self.on_host_changed)
+        manage_hosts_btn.clicked.connect(self.manage_hosts)
         
         # SSH连接设置
         ssh_group = QGroupBox("SSH连接设置")
@@ -228,7 +446,7 @@ class MainWindow(QMainWindow):
         date_layout.addLayout(date_range_layout)
         
         # 添加日期说明
-        date_info = QLabel("注意：将自动匹配文件名中包含选定日期范围的日志文件\n支持的文件名格式：CenterDevCtrl_YYYY-MM-DD.log 或 CenterDevCtrl_YYYY-MM-DD.zip")
+        date_info = QLabel("注意：将自动匹配文件名中包含选定日期范围的日志文件\n支持的文件名格式：xxxx_YYYY-MM-DD.log 或 xxxx_YYYY-MM-DD.zip")
         date_info.setStyleSheet("color: gray;")
         date_layout.addWidget(date_info)
         
@@ -279,6 +497,7 @@ class MainWindow(QMainWindow):
         button_layout.addWidget(self.start_button)
         
         # 添加所有组件到主布局
+        layout.addWidget(host_select_group)
         layout.addWidget(ssh_group)
         layout.addWidget(date_group)
         layout.addWidget(path_group)
@@ -288,6 +507,79 @@ class MainWindow(QMainWindow):
         
         # 加载配置
         self.load_config()
+        # 加载主机列表
+        self.load_hosts_data()
+    
+    def load_hosts_data(self):
+        """加载主机数据到下拉框"""
+        try:
+            hosts_file_path = self.get_hosts_file_path()
+            if os.path.exists(hosts_file_path):
+                with open(hosts_file_path, 'r', encoding='utf-8') as f:
+                    self.hosts_data = yaml.safe_load(f) or []
+            else:
+                self.hosts_data = []
+                
+            # 更新下拉框
+            self.update_hosts_combo()
+        except Exception as e:
+            self.log_message(f"加载主机列表失败: {str(e)}")
+    
+    def update_hosts_combo(self):
+        """更新主机下拉框"""
+        self.host_combo.clear()
+        self.host_combo.addItem("-- 请选择主机 --", None)
+        
+        for i, host in enumerate(self.hosts_data):
+            self.host_combo.addItem(host.get("name", f"未命名主机{i+1}"), i)
+    
+    def on_host_changed(self, index):
+        """主机选择变化时更新界面"""
+        if index <= 0:  # 没有选择有效主机
+            return
+        
+        host_index = self.host_combo.currentData()
+        if host_index is not None and host_index < len(self.hosts_data):
+            host_data = self.hosts_data[host_index]
+            
+            # 更新SSH信息
+            self.host_input.setText(host_data.get("ssh", {}).get("host", ""))
+            self.port_input.setValue(host_data.get("ssh", {}).get("port", 22))
+            self.username_input.setText(host_data.get("ssh", {}).get("username", ""))
+            self.password_input.setText(host_data.get("ssh", {}).get("password", ""))
+            
+            # 更新路径列表
+            self.path_list.clear()
+            for path in host_data.get("log_paths", []):
+                self.path_list.addItem(path)
+    
+    def manage_hosts(self):
+        """打开主机管理对话框"""
+        dialog = HostManagerDialog(self, self.hosts_data)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.hosts_data = dialog.get_hosts_data()
+            self.save_hosts_data()
+            self.update_hosts_combo()
+    
+    def save_hosts_data(self):
+        """保存主机数据到文件"""
+        try:
+            hosts_file_path = self.get_hosts_file_path()
+            with open(hosts_file_path, 'w', encoding='utf-8') as f:
+                yaml.dump(self.hosts_data, f, allow_unicode=True)
+        except Exception as e:
+            self.log_message(f"保存主机列表失败: {str(e)}")
+    
+    def get_hosts_file_path(self):
+        """获取主机配置文件路径"""
+        if getattr(sys, 'frozen', False):
+            # 如果是打包后的exe，保存在exe所在目录
+            base_path = os.path.dirname(sys.executable)
+        else:
+            # 如果是开发环境
+            base_path = os.path.dirname(os.path.abspath(__file__))
+        
+        return os.path.join(base_path, 'hosts.yaml')
     
     def load_config(self):
         try:
@@ -320,6 +612,25 @@ class MainWindow(QMainWindow):
             self.password_input.setText("")
     
     def save_config(self):
+        # 获取当前选择的主机索引
+        host_index = self.host_combo.currentData()
+        if host_index is not None and host_index < len(self.hosts_data):
+            # 更新主机数据
+            self.hosts_data[host_index]["ssh"] = {
+                'host': self.host_input.text(),
+                'port': self.port_input.value(),
+                'username': self.username_input.text(),
+                'password': self.password_input.text()
+            }
+            self.hosts_data[host_index]["log_paths"] = [
+                self.path_list.item(i).text() 
+                for i in range(self.path_list.count())
+            ]
+            
+            # 保存主机列表
+            self.save_hosts_data()
+        
+        # 保存常规配置
         config = {
             'ssh': {
                 'host': self.host_input.text(),
