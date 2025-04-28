@@ -185,11 +185,6 @@ class LogCollector:
             Exception: 收集过程中的错误
         """
         try:
-            # 创建本地保存目录
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            local_dir = os.path.join("collected_logs", timestamp)
-            os.makedirs(local_dir, exist_ok=True)
-
             # 获取日期范围
             date_range = self.config.get('date_range', {})
             use_date_range = date_range.get('enabled', False)
@@ -199,6 +194,20 @@ class LogCollector:
                 end_date = datetime.datetime.strptime(
                     date_range['end_date'], '%Y-%m-%d').date()
                 self.logger.info(f"使用日期范围: {start_date} 到 {end_date}")
+                # 如果开始日期和结束日期相同，使用该日期；否则使用结束日期
+                log_date = start_date if start_date == end_date else end_date
+            else:
+                # 如果没有指定日期范围，使用当前日期
+                log_date = datetime.date.today()
+            
+            # 生成标准命名格式
+            date_str = log_date.strftime("%Y-%m-%d")
+            standard_zip_name = f"wcLog_{date_str}.zip"
+            
+            # 创建本地保存目录
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            local_dir = os.path.join("collected_logs", timestamp)
+            os.makedirs(local_dir, exist_ok=True)
 
             # 检查远程系统类型
             is_windows = self.is_remote_windows()
@@ -326,14 +335,14 @@ class LogCollector:
             if len(downloaded_files) == 1 and downloaded_files[0].lower().endswith('.zip'):
                 self.logger.info(f"只下载了一个zip文件，不再进行压缩")
                 single_zip_path = os.path.join(local_dir, downloaded_files[0])
-                final_zip_path = f"{local_dir}.zip"
+                final_zip_path = os.path.join(os.path.dirname(local_dir), standard_zip_name)
                 shutil.copy2(single_zip_path, final_zip_path)
                 # 删除临时目录及其内容
                 shutil.rmtree(local_dir)
                 return final_zip_path
 
             # 压缩下载的文件
-            zip_path = f"{local_dir}.zip"
+            zip_path = os.path.join(os.path.dirname(local_dir), standard_zip_name)
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
                 for root, _, files in os.walk(local_dir):
                     for file in files:
