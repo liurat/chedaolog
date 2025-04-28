@@ -830,6 +830,9 @@ class MainWindow(QMainWindow):
         # 主机配置数据
         self.hosts_data = []
         
+        # 创建菜单栏
+        self.create_menu_bar()
+        
         # 创建主窗口部件
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -1122,8 +1125,15 @@ class MainWindow(QMainWindow):
         export_layout = QHBoxLayout()
         export_btn = QPushButton("导出结果")
         export_btn.clicked.connect(self.export_results)
-        export_layout.addStretch(1)
+        
+        # 添加清除缓存按钮
+        clear_cache_btn = QPushButton("清除缓存")
+        clear_cache_btn.clicked.connect(self.clear_log_cache)
+        
+        export_layout.addStretch(1)  # 推动按钮到右侧
         export_layout.addWidget(export_btn)
+        export_layout.addWidget(clear_cache_btn)
+        
         result_layout.addLayout(export_layout)
         
         # 右侧：操作日志记录
@@ -1173,6 +1183,55 @@ class MainWindow(QMainWindow):
         self.load_config()
         # 加载主机列表
         self.load_hosts_data()
+    
+    def create_menu_bar(self):
+        """创建菜单栏"""
+        menu_bar = self.menuBar()
+        
+        # 文件菜单
+        file_menu = menu_bar.addMenu("文件")
+        
+        # 清除缓存动作
+        clear_cache_action = file_menu.addAction("清除日志缓存")
+        clear_cache_action.triggered.connect(self.clear_log_cache)
+        
+        # 退出动作
+        exit_action = file_menu.addAction("退出")
+        exit_action.triggered.connect(self.close)
+    
+    def clear_log_cache(self):
+        """清除日志缓存文件"""
+        try:
+            import tempfile
+            import os
+            import shutil
+            
+            # 获取缓存目录
+            cache_dir = os.path.join(tempfile.gettempdir(), "log_cache")
+            
+            if os.path.exists(cache_dir):
+                # 计算缓存文件数量和总大小
+                file_count = 0
+                total_size = 0
+                for file_name in os.listdir(cache_dir):
+                    file_path = os.path.join(cache_dir, file_name)
+                    if os.path.isfile(file_path):
+                        file_count += 1
+                        total_size += os.path.getsize(file_path)
+                
+                # 删除缓存目录
+                shutil.rmtree(cache_dir)
+                
+                # 显示成功消息
+                size_mb = total_size / (1024 * 1024)
+                self.log_message(f"缓存清除成功！删除了 {file_count} 个缓存文件，释放了 {size_mb:.2f} MB 空间")
+                QMessageBox.information(self, "清除缓存", f"缓存清除成功！\n删除了 {file_count} 个缓存文件，释放了 {size_mb:.2f} MB 空间")
+            else:
+                self.log_message("缓存目录不存在，无需清理")
+                QMessageBox.information(self, "清除缓存", "缓存目录不存在，无需清理")
+        except Exception as e:
+            self.log_message(f"清除缓存失败: {str(e)}")
+            QMessageBox.critical(self, "错误", f"清除缓存失败：\n{str(e)}")
     
     def load_hosts_data(self):
         """加载主机数据到下拉框"""
