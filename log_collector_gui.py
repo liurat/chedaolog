@@ -208,18 +208,40 @@ class HostInputDialog(QDialog):
         path_group = QGroupBox("日志文件路径")
         path_layout = QVBoxLayout(path_group)
         
-        self.path_list = QListWidget()
-        self.path_list.setMinimumHeight(100)
+        # 添加路径说明
+        path_info = QLabel("请输入日志文件所在的目录，程序会自动查找并下载符合日期条件的日志文件\n支持的文件类型：.log 和 .zip")
+        path_info.setStyleSheet("color: gray;")
+        path_layout.addWidget(path_info)
         
-        # 路径操作按钮
-        path_buttons = QHBoxLayout()
+        # 创建路径列表和按钮的完整容器
+        path_list_container = QWidget()
+        path_list_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        path_list_layout = QVBoxLayout(path_list_container)
+        path_list_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # 添加路径列表
+        self.path_list = QListWidget()
+        self.path_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        path_list_layout.addWidget(self.path_list, 1)  # 1是拉伸因子，让列表获得尽可能多的空间
+        
+        # 路径操作按钮容器，使用水平布局
+        path_buttons_container = QWidget()
+        path_buttons_container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        path_buttons = QHBoxLayout(path_buttons_container)
+        path_buttons.setContentsMargins(0, 0, 0, 0)
+        
+        # 添加按钮
         add_path_btn = QPushButton("添加目录")
         remove_path_btn = QPushButton("删除选中")
         path_buttons.addWidget(add_path_btn)
         path_buttons.addWidget(remove_path_btn)
+        path_buttons.addStretch(1)  # 添加空白区域推开按钮
         
-        path_layout.addWidget(self.path_list)
-        path_layout.addLayout(path_buttons)
+        # 添加按钮区域到列表容器
+        path_list_layout.addWidget(path_buttons_container)
+        
+        # 将完整容器添加到路径组布局
+        path_layout.addWidget(path_list_container)
         
         # 连接按钮事件
         add_path_btn.clicked.connect(self.add_path)
@@ -468,18 +490,35 @@ class MainWindow(QMainWindow):
         path_info.setStyleSheet("color: gray;")
         path_layout.addWidget(path_info)
         
-        self.path_list = QListWidget()
-        self.path_list.setMinimumHeight(100)
+        # 创建路径列表和按钮的完整容器
+        path_list_container = QWidget()
+        path_list_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        path_list_layout = QVBoxLayout(path_list_container)
+        path_list_layout.setContentsMargins(0, 0, 0, 0)
         
-        # 路径操作按钮
-        path_buttons = QHBoxLayout()
+        # 添加路径列表
+        self.path_list = QListWidget()
+        self.path_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        path_list_layout.addWidget(self.path_list, 1)  # 1是拉伸因子，让列表获得尽可能多的空间
+        
+        # 路径操作按钮容器，使用水平布局
+        path_buttons_container = QWidget()
+        path_buttons_container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        path_buttons = QHBoxLayout(path_buttons_container)
+        path_buttons.setContentsMargins(0, 0, 0, 0)
+        
+        # 添加按钮
         add_path_btn = QPushButton("添加目录")
         remove_path_btn = QPushButton("删除选中")
         path_buttons.addWidget(add_path_btn)
         path_buttons.addWidget(remove_path_btn)
+        path_buttons.addStretch(1)  # 添加空白区域推开按钮
         
-        path_layout.addWidget(self.path_list)
-        path_layout.addLayout(path_buttons)
+        # 添加按钮区域到列表容器
+        path_list_layout.addWidget(path_buttons_container)
+        
+        # 将完整容器添加到路径组布局
+        path_layout.addWidget(path_list_container)
         
         # 连接按钮事件
         add_path_btn.clicked.connect(self.add_path)
