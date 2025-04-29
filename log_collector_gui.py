@@ -11,10 +11,16 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QSpinBox, QListWidget, QCalendarWidget, QGroupBox,
                            QCheckBox, QDateEdit, QDialog, QComboBox, QTableWidget,
                            QTableWidgetItem, QHeaderView, QDialogButtonBox, QTabWidget,
-                           QSizePolicy, QListWidgetItem, QSplitter)
+                           QSizePolicy, QListWidgetItem, QSplitter, QGridLayout,
+                           QProgressDialog)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QDate
 from log_collector import LogCollector
 import re
+import functools
+import io
+import zipfile
+import tempfile
+import shutil
 
 class LogCollectorWorker(QThread):
     progress = pyqtSignal(str, int, int)  # 文件名，当前进度，总大小
@@ -197,110 +203,105 @@ class LogCollectorWorker(QThread):
                         file_path = os.path.join(path, file)
                         if os.path.isfile(file_path):
                             # 检查文件类型
-                            if file.endswith(('.log', '.zip')):
-                                # 检查日期范围
-                                if 'date_range' in self.config and self.config['date_range'].get('enabled', False):
-                                    # 尝试从文件名中提取日期
-                                    import re
-                                    date_match = re.search(r'(\d{4}-\d{2}-\d{2})', file)
+                            if file.endswith('.log') or file.endswith('.zip'):
+                                # 检查日期范围（如果有设置）
+                                if self.config.get('use_date_range', False):
+                                    start_date = datetime.strptime(self.config.get('start_date', ''), '%Y-%m-%d')
+                                    end_date = datetime.strptime(self.config.get('end_date', ''), '%Y-%m-%d')
+                                    end_date = end_date.replace(hour=23, minute=59, second=59)  # 设置为当天结束时间
                                     
+                                    # 尝试从文件名中提取日期
+                                    date_match = re.search(r'(\d{4}-\d{2}-\d{2})', file)
                                     if date_match:
                                         file_date_str = date_match.group(1)
                                         try:
-                                            file_date = datetime.strptime(file_date_str, '%Y-%m-%d').date()
-                                            start_date = datetime.strptime(
-                                                self.config['date_range']['start_date'], '%Y-%m-%d').date()
-                                            end_date = datetime.strptime(
-                                                self.config['date_range']['end_date'], '%Y-%m-%d').date()
-                                            
-                                            # 检查日期是否在范围内
-                                            if start_date <= file_date <= end_date:
-                                                collected_files.append(file_path)
-                                        except Exception as e:
-                                            # 如果日期解析失败，跳过此文件
-                                            continue
-                                else:
-                                    # 如果没有日期筛选，直接添加
-                                    collected_files.append(file_path)
+                                            file_date = datetime.strptime(file_date_str, '%Y-%m-%d')
+                                            if not (start_date <= file_date <= end_date):
+                                                continue  # 跳过不在日期范围内的文件
+                                        except ValueError:
+                                            pass  # 解析失败，保留文件
+                                
+                                # 将文件添加到收集列表
+                                collected_files.append(file_path)
+                                
+                                # 复制文件到临时目录
+                                dest_path = os.path.join(temp_dir, file)
+                                shutil.copy2(file_path, dest_path)
+                                
+                                # 更新进度
+                                file_size = os.path.getsize(file_path)
+                                self.update_progress(file, file_size, file_size)
             
-            # 如果没有找到符合条件的文件
-            if not collected_files:
-                self.finished.emit("")
-                return
-            
-            # 拷贝文件到临时目录
-            for i, file_path in enumerate(collected_files):
-                file_name = os.path.basename(file_path)
-                dest_path = os.path.join(temp_dir, file_name)
+            if collected_files:
+                # 创建zip文件
+                timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+                zip_path = os.path.join(os.path.expanduser('~'), f'logs_{timestamp}.zip')
                 
-                # 更新进度
-                self.progress.emit(file_name, i, len(collected_files))
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    for file in os.listdir(temp_dir):
+                        file_path = os.path.join(temp_dir, file)
+                        zipf.write(file_path, arcname=file)
                 
-                # 复制文件
-                shutil.copy2(file_path, dest_path)
-            
-            # 创建zip文件
-            timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-            zip_path = os.path.join(os.getcwd(), f'collected_logs_{timestamp}.zip')
-            
-            with zipfile.ZipFile(zip_path, 'w') as zipf:
-                for file in os.listdir(temp_dir):
-                    file_path = os.path.join(temp_dir, file)
-                    # 更新进度
-                    self.progress.emit(file, len(collected_files), len(collected_files))
-                    zipf.write(file_path, os.path.basename(file_path))
-            
-            self.finished.emit(zip_path)
-        
+                # 发送完成信号
+                self.finished.emit(zip_path)
+            else:
+                self.error.emit("没有找到符合条件的日志文件")
+                
         except Exception as e:
-            self.error.emit(f"本地收集日志失败: {str(e)}")
-            if zip_path and os.path.exists(zip_path):
-                os.remove(zip_path)
-            self.finished.emit("")
-        
+            self.error.emit(f"收集日志失败: {str(e)}")
         finally:
             # 清理临时目录
-            shutil.rmtree(temp_dir, ignore_errors=True)
-
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+    
     def update_progress(self, filename, current, total):
-        """
-        更新进度条
-        Args:
-            filename: 当前正在下载的文件名
-            current: 当前已下载的字节数
-            total: 文件总字节数
-        """
-        # 发送进度信号
+        """更新进度信号"""
         self.progress.emit(filename, current, total)
 
 class PathInputDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("添加远程目录路径")
+        self.setWindowTitle("添加日志路径")
         self.setMinimumWidth(400)
         
+        # 创建布局
         layout = QVBoxLayout(self)
         
-        # 添加说明标签
-        info_label = QLabel("请输入远程主机上的日志目录完整路径\n例如：/var/log/车道系统/")
+        # 创建表单
+        form_layout = QHBoxLayout()
+        path_label = QLabel("路径:")
+        self.path_input = QLineEdit()
+        browse_btn = QPushButton("浏览...")
+        
+        form_layout.addWidget(path_label)
+        form_layout.addWidget(self.path_input, 1)  # 1是拉伸因子，让输入框获得更多空间
+        form_layout.addWidget(browse_btn)
+        
+        # 添加表单到主布局
+        layout.addLayout(form_layout)
+        
+        # 提示信息
+        info_label = QLabel("请输入远程服务器上的日志目录路径，程序将递归查找该目录下的所有日志文件。")
         info_label.setStyleSheet("color: gray;")
+        info_label.setWordWrap(True)
         layout.addWidget(info_label)
         
-        # 添加输入框
-        self.path_input = QLineEdit()
-        self.path_input.setPlaceholderText("输入远程目录路径")
-        layout.addWidget(self.path_input)
+        # 添加确定取消按钮
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
         
-        # 添加按钮
-        button_layout = QHBoxLayout()
-        ok_button = QPushButton("确定")
-        cancel_button = QPushButton("取消")
-        button_layout.addWidget(ok_button)
-        button_layout.addWidget(cancel_button)
-        layout.addLayout(button_layout)
-        
-        ok_button.clicked.connect(self.accept)
-        cancel_button.clicked.connect(self.reject)
+        # 连接按钮事件
+        browse_btn.clicked.connect(self.browse_path)
+    
+    def browse_path(self):
+        # 打开文件对话框选择目录
+        path = QFileDialog.getExistingDirectory(
+            self, "选择日志目录", os.path.expanduser("~")
+        )
+        if path:
+            self.path_input.setText(path)
     
     def get_path(self):
         return self.path_input.text().strip()
@@ -308,29 +309,28 @@ class PathInputDialog(QDialog):
 class HostInputDialog(QDialog):
     def __init__(self, parent=None, host_data=None):
         super().__init__(parent)
-        self.setWindowTitle("添加/编辑主机信息")
+        self.setWindowTitle("添加主机")
         self.setMinimumWidth(500)
         
+        # 创建布局
         layout = QVBoxLayout(self)
         
         # 主机名称
         name_layout = QHBoxLayout()
-        name_label = QLabel("主机名称:")
+        name_label = QLabel("名称:")
         self.name_input = QLineEdit()
-        self.name_input.setPlaceholderText("例如: 生产服务器")
         name_layout.addWidget(name_label)
         name_layout.addWidget(self.name_input)
         layout.addLayout(name_layout)
         
-        # SSH连接信息
+        # SSH连接设置
         ssh_group = QGroupBox("SSH连接设置")
         ssh_layout = QVBoxLayout(ssh_group)
         
-        # 主机地址
+        # 主机设置
         host_layout = QHBoxLayout()
         host_label = QLabel("主机地址:")
         self.host_input = QLineEdit()
-        self.host_input.setPlaceholderText("例如: 192.168.1.100")
         port_label = QLabel("端口:")
         self.port_input = QSpinBox()
         self.port_input.setRange(1, 65535)
@@ -339,9 +339,8 @@ class HostInputDialog(QDialog):
         host_layout.addWidget(self.host_input)
         host_layout.addWidget(port_label)
         host_layout.addWidget(self.port_input)
-        ssh_layout.addLayout(host_layout)
         
-        # 用户名密码
+        # 用户名密码设置
         credentials_layout = QHBoxLayout()
         username_label = QLabel("用户名:")
         self.username_input = QLineEdit()
@@ -352,6 +351,8 @@ class HostInputDialog(QDialog):
         credentials_layout.addWidget(self.username_input)
         credentials_layout.addWidget(password_label)
         credentials_layout.addWidget(self.password_input)
+        
+        ssh_layout.addLayout(host_layout)
         ssh_layout.addLayout(credentials_layout)
         
         layout.addWidget(ssh_group)
@@ -360,25 +361,17 @@ class HostInputDialog(QDialog):
         path_group = QGroupBox("日志文件路径")
         path_layout = QVBoxLayout(path_group)
         
-        # 添加路径说明
-        path_info = QLabel("请输入日志文件所在的目录，程序会自动查找并下载符合日期条件的日志文件\n支持的文件类型：.log 和 .zip")
-        path_info.setStyleSheet("color: gray;")
-        path_layout.addWidget(path_info)
-        
         # 创建路径列表和按钮的完整容器
         path_list_container = QWidget()
-        path_list_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         path_list_layout = QVBoxLayout(path_list_container)
         path_list_layout.setContentsMargins(0, 0, 0, 0)
         
         # 添加路径列表
         self.path_list = QListWidget()
-        self.path_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        path_list_layout.addWidget(self.path_list, 1)  # 1是拉伸因子，让列表获得尽可能多的空间
+        path_list_layout.addWidget(self.path_list)
         
         # 路径操作按钮容器，使用水平布局
         path_buttons_container = QWidget()
-        path_buttons_container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         path_buttons = QHBoxLayout(path_buttons_container)
         path_buttons.setContentsMargins(0, 0, 0, 0)
         
@@ -419,6 +412,7 @@ class HostInputDialog(QDialog):
                 self.path_list.addItem(path)
     
     def add_path(self):
+        """添加日志路径"""
         dialog = PathInputDialog(self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             path = dialog.get_path()
@@ -426,11 +420,13 @@ class HostInputDialog(QDialog):
                 self.path_list.addItem(path)
     
     def remove_path(self):
-        current_item = self.path_list.currentItem()
-        if current_item:
-            self.path_list.takeItem(self.path_list.row(current_item))
+        """删除选中的路径"""
+        selected_items = self.path_list.selectedItems()
+        for item in selected_items:
+            self.path_list.takeItem(self.path_list.row(item))
     
     def get_host_data(self):
+        """获取主机数据"""
         return {
             "name": self.name_input.text(),
             "ssh": {
@@ -440,61 +436,67 @@ class HostInputDialog(QDialog):
                 "password": self.password_input.text()
             },
             "log_paths": [self.path_list.item(i).text() 
-                         for i in range(self.path_list.count())]
+                          for i in range(self.path_list.count())]
         }
 
 class HostManagerDialog(QDialog):
     def __init__(self, parent=None, hosts_data=None):
         super().__init__(parent)
         self.setWindowTitle("主机管理")
-        self.setMinimumSize(700, 400)
+        self.setMinimumSize(600, 400)
         
+        # 主机数据
         self.hosts_data = hosts_data or []
         
+        # 创建布局
         layout = QVBoxLayout(self)
         
-        # 主机列表表格
-        self.hosts_table = QTableWidget()
-        self.hosts_table.setColumnCount(4)
-        self.hosts_table.setHorizontalHeaderLabels(["主机名称", "主机地址", "用户名", "日志路径数"])
-        self.hosts_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        # 主机列表区域
+        host_list_layout = QHBoxLayout()
         
-        layout.addWidget(self.hosts_table)
+        # 主机列表
+        self.host_list = QListWidget()
+        self.host_list.setMinimumWidth(150)
+        host_list_layout.addWidget(self.host_list, 1)
         
-        # 操作按钮
-        button_layout = QHBoxLayout()
-        add_host_btn = QPushButton("添加主机")
-        edit_host_btn = QPushButton("编辑主机")
-        delete_host_btn = QPushButton("删除主机")
-        button_layout.addWidget(add_host_btn)
-        button_layout.addWidget(edit_host_btn)
-        button_layout.addWidget(delete_host_btn)
+        # 按钮区域
+        button_layout = QVBoxLayout()
+        self.add_btn = QPushButton("添加")
+        self.edit_btn = QPushButton("编辑")
+        self.delete_btn = QPushButton("删除")
+        button_layout.addWidget(self.add_btn)
+        button_layout.addWidget(self.edit_btn)
+        button_layout.addWidget(self.delete_btn)
+        button_layout.addStretch(1)
+        host_list_layout.addLayout(button_layout)
         
-        # 确定取消按钮
-        close_btn = QPushButton("关闭")
-        button_layout.addWidget(close_btn)
+        layout.addLayout(host_list_layout)
         
-        layout.addLayout(button_layout)
+        # 添加确定取消按钮
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
         
         # 连接信号
-        add_host_btn.clicked.connect(self.add_host)
-        edit_host_btn.clicked.connect(self.edit_host)
-        delete_host_btn.clicked.connect(self.delete_host)
-        close_btn.clicked.connect(self.accept)
+        self.add_btn.clicked.connect(self.add_host)
+        self.edit_btn.clicked.connect(self.edit_host)
+        self.delete_btn.clicked.connect(self.delete_host)
         
-        # 加载主机数据
+        # 加载主机列表
         self.load_hosts()
     
     def load_hosts(self):
-        self.hosts_table.setRowCount(len(self.hosts_data))
-        
-        for row, host in enumerate(self.hosts_data):
-            self.hosts_table.setItem(row, 0, QTableWidgetItem(host.get("name", "")))
-            self.hosts_table.setItem(row, 1, QTableWidgetItem(host.get("ssh", {}).get("host", "")))
-            self.hosts_table.setItem(row, 2, QTableWidgetItem(host.get("ssh", {}).get("username", "")))
-            self.hosts_table.setItem(row, 3, QTableWidgetItem(str(len(host.get("log_paths", [])))))
+        """加载主机列表"""
+        self.host_list.clear()
+        for i, host in enumerate(self.hosts_data):
+            name = host.get("name", f"未命名主机{i+1}")
+            item = QListWidgetItem(name)
+            item.setData(Qt.ItemDataRole.UserRole, i)  # 存储主机索引
+            self.host_list.addItem(item)
     
     def add_host(self):
+        """添加新主机"""
         dialog = HostInputDialog(self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             host_data = dialog.get_host_data()
@@ -502,25 +504,41 @@ class HostManagerDialog(QDialog):
             self.load_hosts()
     
     def edit_host(self):
-        current_row = self.hosts_table.currentRow()
-        if current_row >= 0 and current_row < len(self.hosts_data):
-            dialog = HostInputDialog(self, self.hosts_data[current_row])
-            if dialog.exec() == QDialog.DialogCode.Accepted:
-                self.hosts_data[current_row] = dialog.get_host_data()
-                self.load_hosts()
+        """编辑选中的主机"""
+        selected_items = self.host_list.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "警告", "请先选择要编辑的主机")
+            return
+        
+        item = selected_items[0]
+        host_index = item.data(Qt.ItemDataRole.UserRole)
+        host_data = self.hosts_data[host_index]
+        
+        dialog = HostInputDialog(self, host_data)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.hosts_data[host_index] = dialog.get_host_data()
+            self.load_hosts()
     
     def delete_host(self):
-        current_row = self.hosts_table.currentRow()
-        if current_row >= 0 and current_row < len(self.hosts_data):
-            host_name = self.hosts_data[current_row].get("name", "")
-            reply = QMessageBox.question(self, "确认删除", 
-                                       f"确定要删除主机 '{host_name}' 吗？",
-                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            if reply == QMessageBox.StandardButton.Yes:
-                del self.hosts_data[current_row]
-                self.load_hosts()
+        """删除选中的主机"""
+        selected_items = self.host_list.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "警告", "请先选择要删除的主机")
+            return
+        
+        item = selected_items[0]
+        host_index = item.data(Qt.ItemDataRole.UserRole)
+        
+        # 确认删除
+        result = QMessageBox.question(self, "确认删除", 
+                                     f"确定要删除主机 \"{item.text()}\" 吗？", 
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if result == QMessageBox.StandardButton.Yes:
+            del self.hosts_data[host_index]
+            self.load_hosts()
     
     def get_hosts_data(self):
+        """获取主机数据"""
         return self.hosts_data
 
 class LogAnalysisWorker(QThread):
@@ -538,9 +556,9 @@ class LogAnalysisWorker(QThread):
         self.keyword = keyword
     
     def log_message(self, message):
-        """发送普通日志消息"""
+        """发送日志消息"""
         self.log_message_signal.emit(message)
-        
+    
     def run(self):
         try:
             # 检查是否为本地测试模式
@@ -555,11 +573,12 @@ class LogAnalysisWorker(QThread):
             try:
                 if self.mode == 'list':
                     # 获取日志文件列表
-                    self.get_log_files(collector)
+                    files = self.get_log_files(collector)
+                    self.log_list.emit(files)
                 elif self.mode == 'search':
-                    # 在日志中搜索关键字
+                    # 搜索关键字
                     self.search_keyword(collector)
-                elif self.mode == 'get_log':
+                elif self.mode == 'full':
                     # 获取完整日志
                     self.get_full_log(collector)
             finally:
@@ -569,479 +588,412 @@ class LogAnalysisWorker(QThread):
     
     def get_log_files(self, collector):
         """获取日志文件列表"""
-        all_logs = []
+        log_files = []
         
+        # 获取日期范围
+        start_date = datetime.strptime(self.config.get('start_date_analysis', ''), '%Y-%m-%d')
+        end_date = datetime.strptime(self.config.get('end_date_analysis', ''), '%Y-%m-%d')
+        end_date = end_date.replace(hour=23, minute=59, second=59)  # 设置为当天结束时间
+        
+        # 遍历所有日志路径
         for path in self.config['log_paths']:
-            try:
-                # 根据系统类型选择命令
-                if collector.is_remote_windows():
-                    # Windows系统使用dir命令
-                    cmd = f'dir /O-D "{path}"'
+            self.log_message(f"获取目录中的日志文件: {path}")
+            
+            # 根据系统类型选择命令
+            if collector.is_remote_windows():
+                # Windows系统使用dir命令
+                cmd = f'dir /S /B "{path}\\*.log" "{path}\\*.zip"'
+                try:
                     stdin, stdout, stderr = collector.ssh.exec_command(cmd)
                     try:
                         files = stdout.read().decode('gbk').splitlines()
                     except UnicodeDecodeError:
-                        # 如果读取失败，重新执行命令
                         stdin, stdout, stderr = collector.ssh.exec_command(cmd)
                         files = stdout.read().decode('utf-8', errors='ignore').splitlines()
-                    
-                    # 跳过Windows dir命令的头部信息
-                    start_idx = 0
-                    for i, line in enumerate(files):
-                        if "Directory of" in line:
-                            start_idx = i + 2
-                            break
-                    
-                    files = files[start_idx:]
-                    
-                    # 解析文件信息
-                    file_info_list = []
-                    for line in files:
-                        if not line.strip() or "<DIR>" in line:
-                            continue
-                        
-                        parts = line.strip().split()
-                        if len(parts) >= 4:
-                            # Windows dir命令格式: 日期 时间 大小 文件名
-                            try:
-                                date_str = parts[0]
-                                time_str = parts[1]
-                                # 文件名可能包含空格，所以要合并后面的所有部分
-                                filename = ' '.join(parts[3:])
-                                file_info_list.append({
-                                    'name': filename,
-                                    'date': f"{date_str} {time_str}",
-                                    'path': path
-                                })
-                            except:
-                                continue
-                else:
-                    # Linux系统使用ls命令
-                    cmd = f'ls -1 {path}'
+                except:
+                    # 如果出错，尝试不使用/S参数（不递归子目录）
+                    cmd = f'dir /B "{path}\\*.log" "{path}\\*.zip"'
                     stdin, stdout, stderr = collector.ssh.exec_command(cmd)
                     try:
-                        files = stdout.read().decode('utf-8').splitlines()
+                        files = stdout.read().decode('gbk').splitlines()
                     except UnicodeDecodeError:
-                        files = stdout.read().decode('gbk', errors='ignore').splitlines()
+                        stdin, stdout, stderr = collector.ssh.exec_command(cmd)
+                        files = stdout.read().decode('utf-8', errors='ignore').splitlines()
                 
-                # 过滤出支持的文件类型
-                supported_files = []
-                for file in files:
-                    file = file.strip()
-                    if collector.is_supported_file(file):
-                        # 检查日期范围
-                        if 'date_range' in self.config and self.config['date_range'].get('enabled', False):
-                            start_date = datetime.strptime(
-                                self.config['date_range']['start_date'], '%Y-%m-%d').date()
-                            end_date = datetime.strptime(
-                                self.config['date_range']['end_date'], '%Y-%m-%d').date()
-                            
-                            if collector.is_log_in_date_range(file, start_date, end_date):
-                                full_path = f"{path.rstrip('/')}/{file}"
-                                supported_files.append({
-                                    'name': file,
-                                    'path': full_path
-                                })
-                        else:
-                            full_path = f"{path.rstrip('/')}/{file}"
-                            supported_files.append({
-                                'name': file,
-                                'path': full_path
-                            })
+                # 遍历找到的文件
+                for file_path in files:
+                    if "File Not Found" in file_path:
+                        continue
+                    
+                    # 提取文件名
+                    file_name = os.path.basename(file_path)
+                    
+                    # 尝试从文件名中提取日期
+                    date_match = re.search(r'(\d{4}-\d{2}-\d{2})', file_name)
+                    if date_match:
+                        file_date_str = date_match.group(1)
+                        try:
+                            file_date = datetime.strptime(file_date_str, '%Y-%m-%d')
+                            if not (start_date <= file_date <= end_date):
+                                continue  # 跳过不在日期范围内的文件
+                        except ValueError:
+                            pass  # 解析失败，保留文件
+                    
+                    # 获取文件信息
+                    cmd = f'dir "{file_path}"'
+                    stdin, stdout, stderr = collector.ssh.exec_command(cmd)
+                    try:
+                        file_info = stdout.read().decode('gbk').splitlines()
+                    except UnicodeDecodeError:
+                        stdin, stdout, stderr = collector.ssh.exec_command(cmd)
+                        file_info = stdout.read().decode('utf-8', errors='ignore').splitlines()
+                    
+                    # 从dir命令输出中提取文件大小
+                    size_str = "未知"
+                    date_str = "未知"
+                    for line in file_info:
+                        if file_name in line:
+                            parts = line.strip().split()
+                            if len(parts) >= 4:
+                                try:
+                                    # 尝试提取日期和大小
+                                    date_str = parts[0]
+                                    size = int(parts[3].replace(',', ''))
+                                    if size < 1024:
+                                        size_str = f"{size} B"
+                                    elif size < 1024 * 1024:
+                                        size_str = f"{size / 1024:.2f} KB"
+                                    else:
+                                        size_str = f"{size / (1024 * 1024):.2f} MB"
+                                except:
+                                    pass
+                    
+                    log_files.append({
+                        'path': file_path,
+                        'name': file_name,
+                        'size': size_str,
+                        'date': date_str
+                    })
+            else:
+                # Linux系统使用find命令查找日志文件
+                cmd = f'find {path} -type f \\( -name "*.log" -o -name "*.zip" \\) -print'
+                stdin, stdout, stderr = collector.ssh.exec_command(cmd)
                 
-                all_logs.extend(supported_files)
-            except Exception as e:
-                self.error.emit(f"获取目录 {path} 中的日志列表失败: {str(e)}")
+                try:
+                    files = stdout.read().decode('utf-8').splitlines()
+                except UnicodeDecodeError:
+                    stdin, stdout, stderr = collector.ssh.exec_command(cmd)
+                    files = stdout.read().decode('utf-8', errors='ignore').splitlines()
+                
+                # 遍历找到的文件
+                for file_path in files:
+                    if not file_path.strip():
+                        continue
+                    
+                    # 提取文件名
+                    file_name = os.path.basename(file_path)
+                    
+                    # 尝试从文件名中提取日期
+                    date_match = re.search(r'(\d{4}-\d{2}-\d{2})', file_name)
+                    if date_match:
+                        file_date_str = date_match.group(1)
+                        try:
+                            file_date = datetime.strptime(file_date_str, '%Y-%m-%d')
+                            if not (start_date <= file_date <= end_date):
+                                continue  # 跳过不在日期范围内的文件
+                        except ValueError:
+                            pass  # 解析失败，保留文件
+                    
+                    # 获取文件信息
+                    cmd = f'ls -lh "{file_path}"'
+                    stdin, stdout, stderr = collector.ssh.exec_command(cmd)
+                    
+                    try:
+                        file_info = stdout.read().decode('utf-8').strip()
+                    except UnicodeDecodeError:
+                        stdin, stdout, stderr = collector.ssh.exec_command(cmd)
+                        file_info = stdout.read().decode('utf-8', errors='ignore').strip()
+                    
+                    # 从ls命令输出中提取文件大小和日期
+                    parts = file_info.split()
+                    size_str = "未知"
+                    date_str = "未知"
+                    if len(parts) >= 8:
+                        try:
+                            size_str = parts[4]
+                            date_str = ' '.join(parts[5:8])
+                        except:
+                            pass
+                    
+                    log_files.append({
+                        'path': file_path,
+                        'name': file_name,
+                        'size': size_str,
+                        'date': date_str
+                    })
         
-        # 发送日志列表信号
-        self.log_list.emit(all_logs)
+        return log_files
     
     def search_keyword(self, collector):
         """在日志文件中搜索关键字"""
+        if not self.log_path or not self.keyword:
+            self.error.emit("缺少日志文件路径或关键字")
+            return
+        
         try:
-            if not self.log_path or not self.keyword:
-                self.error.emit("未指定日志文件或关键字")
-                return
+            # 从日志文件路径中提取文件名
+            log_name = os.path.basename(self.log_path)
             
-            self.log_message(f"准备搜索关键字: '{self.keyword}'")
-            
-            # 使用缓存管理
-            file_name = os.path.basename(self.log_path)
-            cache_file = self._get_cached_file(self.log_path, collector)
-            
-            # 在本地文件中搜索
-            found_lines = []
-            line_numbers = []
-            matching_records = []  # 存储匹配的完整记录
-            earliest_time = None
-            latest_time = None
-            time_pattern = re.compile(r'(\d{2}:\d{2}:\d{2}(?:\.\d+)?)')
-            
-            try:
-                # 尝试多种编码打开文件
-                file_content = self._read_file_with_encoding(cache_file)
-                
-                # 先处理多行JSON记录
-                i = 0
-                while i < len(file_content):
-                    line = file_content[i].strip()
-                    
-                    # 检查是否是JSON记录的开始（包含大括号）
-                    if "{" in line and not line.strip().endswith("}"):
-                        record_start = i
-                        record_lines = [line]
-                        json_content = line
-                        
-                        # 尝试继续读取，直到找到匹配的结束大括号
-                        j = i + 1
-                        while j < len(file_content) and "}" not in file_content[j]:
-                            record_lines.append(file_content[j].strip())
-                            json_content += file_content[j]
-                            j += 1
-                        
-                        # 如果找到了结束括号，添加最后一行
-                        if j < len(file_content):
-                            record_lines.append(file_content[j].strip())
-                            json_content += file_content[j]
-                            
-                            # 检查整个JSON是否包含关键字
-                            if self.keyword in json_content:
-                                # 将整个记录标记为匹配项
-                                matching_records.append((record_start, j, record_lines))
-                                
-                                # 尝试从第一行提取时间
-                                first_line = record_lines[0]
-                                time_match = time_pattern.search(first_line)
-                                if time_match:
-                                    time_str = time_match.group(1)
-                                    if earliest_time is None or time_str < earliest_time:
-                                        earliest_time = time_str
-                                    if latest_time is None or time_str > latest_time:
-                                        latest_time = time_str
-                            
-                            i = j  # 跳过整个JSON记录
-                        else:
-                            i += 1  # 如果没有找到结束括号，继续处理下一行
-                    else:
-                        # 处理普通行
-                        if self.keyword in line:
-                            found_lines.append(line)
-                            line_numbers.append(i)
-                            
-                            # 尝试从行中提取时间
-                            time_match = time_pattern.search(line)
-                            if time_match:
-                                time_str = time_match.group(1)
-                                if earliest_time is None or time_str < earliest_time:
-                                    earliest_time = time_str
-                                if latest_time is None or time_str > latest_time:
-                                    latest_time = time_str
-                        
-                        i += 1
-                
-                # 检查结果
-                total_matches = len(found_lines) + len(matching_records)
-                if total_matches > 0:
-                    self.log_message(f"找到 {total_matches} 个匹配项，时间范围: {earliest_time} - {latest_time}")
-                    
-                    # 如果找到了时间范围，再次处理文件以获取这个时间范围内的所有日志
-                    if earliest_time and latest_time:
-                        all_lines_in_timerange = self._get_full_log_context(file_content, earliest_time, latest_time, time_pattern)
-                        
-                        if all_lines_in_timerange:
-                            self.log_message(f"时间范围内共 {len(all_lines_in_timerange)} 行日志")
-                            self.search_result.emit(self.keyword, all_lines_in_timerange)
-                            return
-                    
-                    # 如果没有找到时间范围或处理失败，合并匹配的单行和记录
-                    all_matched_lines = found_lines.copy()
-                    for _, _, record_lines in matching_records:
-                        all_matched_lines.extend(record_lines)
-                    
-                    self.search_result.emit(self.keyword, all_matched_lines)
+            # 检查是否为zip文件
+            if self.log_path.lower().endswith('.zip'):
+                # 对压缩文件先获取到本地缓存，然后进行搜索
+                cached_file = self._get_cached_file(self.log_path, collector)
+                if not cached_file:
+                    self.error.emit(f"无法获取日志文件: {self.log_path}")
                     return
-                else:
-                    self.log_message("搜索未找到匹配结果")
-                    self.search_result.emit(self.keyword, [])
-                    return
-            except Exception as e:
-                self.error.emit(f"本地搜索方法失败: {str(e)}")
-                # 如果本地搜索失败，继续尝试远程搜索方法
-            
-            # 以下是原来的远程搜索方法（作为备用）
-            # 使用grep命令搜索关键字
-            if collector.is_remote_windows():
-                # Windows系统使用findstr命令
-                cmd = f'findstr /n "{self.keyword}" "{self.log_path}"'
-                if not self.keyword.isascii():  # 如果是非ASCII字符(如中文)
-                    # 对于Windows系统中文搜索，使用type配合findstr
-                    cmd = f'type "{self.log_path}" | findstr /n "{self.keyword}"'
+                
+                # 读取压缩文件内容
+                import zipfile
+                import tempfile
+                
+                # 创建临时目录存放解压的文件
+                temp_dir = tempfile.mkdtemp()
+                results = []
+                
+                try:
+                    # 解压文件
+                    with zipfile.ZipFile(cached_file, 'r') as zip_ref:
+                        # 获取zip文件中的所有文件
+                        file_list = zip_ref.namelist()
+                        
+                        # 遍历压缩包中的每个文件
+                        for file_name in file_list:
+                            # 只处理日志文件
+                            if not file_name.lower().endswith('.log'):
+                                continue
+                            
+                            # 解压到临时目录
+                            zip_ref.extract(file_name, temp_dir)
+                            extracted_file = os.path.join(temp_dir, file_name)
+                            
+                            # 读取文件内容
+                            content = self._read_file_content(extracted_file)
+                            
+                            # 搜索关键字
+                            found_lines = []
+                            for i, line in enumerate(content.splitlines()):
+                                if self.keyword.lower() in line.lower():
+                                    found_lines.append({
+                                        'line_num': i + 1,
+                                        'content': line.strip(),
+                                        'file': file_name
+                                    })
+                            
+                            # 如果找到结果，添加到结果列表
+                            if found_lines:
+                                results.extend(found_lines)
+                    
+                    # 发送搜索结果
+                    self.search_result.emit(self.keyword, results)
+                finally:
+                    # 清理临时目录
+                    import shutil
+                    if os.path.exists(temp_dir):
+                        shutil.rmtree(temp_dir)
             else:
-                # Linux系统使用grep命令，添加字符集支持
-                if not self.keyword.isascii():  # 如果是非ASCII字符(如中文)
-                    # 尝试多种字符集编码
-                    encoding_options = ["--binary-files=text", "--text"]
-                    # 添加LC_ALL=zh_CN.UTF-8环境变量以支持中文
-                    cmd = f'export LC_ALL=zh_CN.UTF-8 || export LC_ALL=C.UTF-8; grep -n {" ".join(encoding_options)} "{self.keyword}" {self.log_path}'
-                else:
-                    cmd = f'grep -n "{self.keyword}" {self.log_path}'
-            
-            self.log_message(f"执行搜索命令: {cmd}")
-            
-            stdin, stdout, stderr = collector.ssh.exec_command(cmd)
-            stdout_data = stdout.read()
-            stderr_data = stderr.read()
-            
-            if stderr_data:
-                self.error.emit(f"搜索错误: {stderr_data.decode('utf-8', errors='ignore')}")
-                
-                # 如果第一次尝试失败且是中文关键字，再尝试一次其他方法
-                if not self.keyword.isascii() and not collector.is_remote_windows():
-                    self.log_message("尝试使用备用方法搜索中文关键字...")
-                    # 使用grep -P (Perl正则模式)搜索
-                    cmd2 = f'export LC_ALL=C.UTF-8; grep -P -n "{self.keyword}" {self.log_path} || grep -a -n "{self.keyword}" {self.log_path}'
-                    self.log_message(f"执行备用搜索命令: {cmd2}")
-                    stdin, stdout, stderr = collector.ssh.exec_command(cmd2)
-                    stdout_data = stdout.read()
-            
-            # 尝试多种编码格式
-            try:
-                results = stdout_data.decode('gbk').splitlines()
-            except UnicodeDecodeError:
-                try:
-                    results = stdout_data.decode('utf-8').splitlines()
-                except UnicodeDecodeError:
-                    results = stdout_data.decode('utf-8', errors='ignore').splitlines()
-            
-            # 解析结果，提取行号
-            parsed_results = []
-            for line in results:
-                try:
-                    # 格式为"行号:内容"
-                    parts = line.split(':', 1)
-                    if len(parts) >= 2:
-                        line_num = int(parts[0])
-                        content = parts[1]
-                        parsed_results.append({
-                            'line': line_num,
-                            'content': content
-                        })
-                except Exception as e:
-                    self.error.emit(f"解析搜索结果失败: {str(e)}, 行内容: {line}")
-            
-            # 如果找到了匹配项，获取最早和最晚的行号
-            if parsed_results:
-                min_line = min(r['line'] for r in parsed_results)
-                max_line = max(r['line'] for r in parsed_results)
-                
-                # 获取这个范围内的所有行
+                # 处理普通日志文件
+                # 根据系统类型选择命令
                 if collector.is_remote_windows():
-                    # Windows使用更简单的命令，避免PowerShell复杂性
-                    line_range = max_line - min_line + 1
-                    cmd = f'more +{min_line-1} "{self.log_path}" | findstr /n "^" | findstr /b "[1-{line_range}]:"'
-                else:
-                    # Linux使用sed命令
-                    cmd = f'sed -n "{min_line},{max_line}p" {self.log_path}'
-                
-                stdin, stdout, stderr = collector.ssh.exec_command(cmd)
-                stdout_data = stdout.read()
-                stderr_data = stderr.read()
-                
-                if stderr_data:
-                    self.error.emit(f"获取内容错误: {stderr_data.decode('utf-8', errors='ignore')}")
-                
-                # 尝试多种编码格式
-                try:
-                    complete_results = stdout_data.decode('gbk').splitlines()
-                except UnicodeDecodeError:
+                    # Windows上使用findstr命令
+                    cmd = f'findstr /N /I "{self.keyword}" "{self.log_path}"'
+                    stdin, stdout, stderr = collector.ssh.exec_command(cmd)
                     try:
-                        complete_results = stdout_data.decode('utf-8').splitlines()
+                        output = stdout.read().decode('gbk')
                     except UnicodeDecodeError:
-                        complete_results = stdout_data.decode('utf-8', errors='ignore').splitlines()
+                        stdin, stdout, stderr = collector.ssh.exec_command(cmd)
+                        output = stdout.read().decode('utf-8', errors='ignore')
+                else:
+                    # Linux上使用grep命令
+                    cmd = f'grep -n -i "{self.keyword}" "{self.log_path}"'
+                    stdin, stdout, stderr = collector.ssh.exec_command(cmd)
+                    output = stdout.read().decode('utf-8')
                 
-                # 去除行号前缀
-                processed_results = []
-                for line in complete_results:
-                    parts = line.split(':', 1)
-                    if len(parts) >= 2:
-                        processed_results.append(parts[1])
-                    else:
-                        processed_results.append(line)
-                
-                # 发送搜索结果信号
-                self.search_result.emit(self.keyword, processed_results)
-            else:
-                # 如果使用第一种方法没找到，尝试使用strings命令过滤二进制文件然后grep
-                if not self.keyword.isascii() and not collector.is_remote_windows():
-                    self.log_message("尝试使用strings命令搜索二进制文件...")
-                    cmd3 = f'strings "{self.log_path}" | grep -n "{self.keyword}"'
-                    self.log_message(f"执行strings搜索命令: {cmd3}")
-                    stdin, stdout, stderr = collector.ssh.exec_command(cmd3)
-                    stdout_data = stdout.read()
+                # 解析搜索结果
+                results = []
+                for line in output.splitlines():
+                    if not line.strip():
+                        continue
                     
-                    if stdout_data:
-                        try:
-                            results = stdout_data.decode('utf-8', errors='ignore').splitlines()
-                            if results:
-                                self.search_result.emit(self.keyword, results)
-                                return
-                        except:
-                            pass
+                    # 尝试解析行号和内容
+                    try:
+                        if ':' in line:
+                            parts = line.split(':', 1)
+                            line_num = int(parts[0])
+                            content = parts[1].strip()
+                            results.append({
+                                'line_num': line_num,
+                                'content': content,
+                                'file': log_name
+                            })
+                    except:
+                        # 如果解析失败，将整行作为内容
+                        results.append({
+                            'line_num': 0,
+                            'content': line.strip(),
+                            'file': log_name
+                        })
                 
-                self.search_result.emit(self.keyword, [])
-                self.log_message(f"未找到包含关键字 '{self.keyword}' 的内容")
+                # 发送搜索结果
+                self.search_result.emit(self.keyword, results)
         except Exception as e:
-            self.error.emit(f"搜索关键字失败: {str(e)}")
+            self.error.emit(f"搜索关键字时出错: {str(e)}")
     
     def get_full_log(self, collector):
-        """获取完整日志内容"""
+        """获取完整的日志内容"""
+        if not self.log_path:
+            self.error.emit("缺少日志文件路径")
+            return
+        
         try:
-            if not self.log_path:
-                self.error.emit("未指定日志文件")
-                return
-            
-            # 检查文件大小
-            if collector.is_remote_windows():
-                cmd = f'powershell -Command "(Get-Item \'{self.log_path}\').length"'
-            else:
-                cmd = f'stat -c %s {self.log_path}'
-            
-            stdin, stdout, stderr = collector.ssh.exec_command(cmd)
-            size_str = stdout.read().decode('utf-8', errors='ignore').strip()
-            
-            try:
-                size = int(size_str)
-                if size > 10 * 1024 * 1024:  # 大于10MB
-                    self.error.emit(f"文件太大 ({size/1024/1024:.1f}MB)，请使用关键字搜索缩小范围")
+            # 检查是否为zip文件
+            if self.log_path.lower().endswith('.zip'):
+                # 对压缩文件先获取到本地缓存，然后进行处理
+                cached_file = self._get_cached_file(self.log_path, collector)
+                if not cached_file:
+                    self.error.emit(f"无法获取日志文件: {self.log_path}")
                     return
-            except:
-                pass  # 忽略转换错误，继续尝试获取文件
-            
-            # 使用缓存管理
-            cache_file = self._get_cached_file(self.log_path, collector)
-            
-            # 读取文件内容
-            try:
-                log_content = self._read_file_content(cache_file)
                 
-                # 发送完整日志信号
-                self.complete_log.emit(log_content)
-                return
-            except Exception as e:
-                self.error.emit(f"本地文件读取失败: {str(e)}")
-                # 如果本地下载失败，继续尝试远程读取方法
-            
-            # 以下是原来的远程获取方法（作为备用）
-            # 获取文件内容
-            if collector.is_remote_windows():
-                # 对于Windows系统，确保使用正确的命令和编码
-                cmd = f'type "{self.log_path}"'
-            else:
-                cmd = f'cat {self.log_path}'
-            
-            stdin, stdout, stderr = collector.ssh.exec_command(cmd)
-            stdout_data = stdout.read()
-            stderr_data = stderr.read()
-            
-            if stderr_data:
-                self.error.emit(f"获取日志内容错误: {stderr_data.decode('utf-8', errors='ignore')}")
-            
-            # 优先尝试GBK编码（中文Windows系统常用）
-            try:
-                log_content = stdout_data.decode('gbk')
-            except UnicodeDecodeError:
+                # 读取压缩文件内容
+                import zipfile
+                import tempfile
+                
+                # 创建临时目录存放解压的文件
+                temp_dir = tempfile.mkdtemp()
+                full_content = ""
+                
                 try:
-                    # 如果GBK失败，尝试UTF-8
-                    log_content = stdout_data.decode('utf-8')
-                except UnicodeDecodeError:
-                    # 最后使用带错误忽略的UTF-8
-                    log_content = stdout_data.decode('utf-8', errors='ignore')
-                    self.error.emit("警告：日志内容编码不匹配，可能有乱码")
-            
-            # 发送完整日志信号
-            self.complete_log.emit(log_content)
+                    # 解压文件
+                    with zipfile.ZipFile(cached_file, 'r') as zip_ref:
+                        # 获取zip文件中的所有文件
+                        file_list = zip_ref.namelist()
+                        
+                        # 遍历压缩包中的每个文件
+                        for file_name in file_list:
+                            # 只处理日志文件
+                            if not file_name.lower().endswith('.log'):
+                                continue
+                            
+                            # 解压到临时目录
+                            zip_ref.extract(file_name, temp_dir)
+                            extracted_file = os.path.join(temp_dir, file_name)
+                            
+                            # 读取文件内容
+                            content = self._read_file_content(extracted_file)
+                            
+                            # 添加文件名标题
+                            full_content += f"\n\n===== {file_name} =====\n\n"
+                            full_content += content
+                    
+                    # 发送完整日志内容
+                    self.complete_log.emit(full_content)
+                finally:
+                    # 清理临时目录
+                    import shutil
+                    if os.path.exists(temp_dir):
+                        shutil.rmtree(temp_dir)
+            else:
+                # 处理普通日志文件
+                # 获取文件内容
+                cached_file = self._get_cached_file(self.log_path, collector)
+                if cached_file:
+                    # 读取本地缓存文件
+                    content = self._read_file_content(cached_file)
+                    self.complete_log.emit(content)
+                else:
+                    # 直接从远程读取文件内容
+                    if collector.is_remote_windows():
+                        cmd = f'type "{self.log_path}"'
+                    else:
+                        cmd = f'cat "{self.log_path}"'
+                    
+                    stdin, stdout, stderr = collector.ssh.exec_command(cmd)
+                    try:
+                        if collector.is_remote_windows():
+                            content = stdout.read().decode('gbk')
+                        else:
+                            content = stdout.read().decode('utf-8')
+                    except UnicodeDecodeError:
+                        content = stdout.read().decode('utf-8', errors='ignore')
+                    
+                    self.complete_log.emit(content)
         except Exception as e:
-            self.error.emit(f"获取日志内容失败: {str(e)}")
+            self.error.emit(f"获取完整日志时出错: {str(e)}")
     
     def _get_cached_file(self, remote_path, collector):
-        """获取缓存的文件，如果缓存不存在则下载"""
-        # 确保缓存目录存在
+        """获取远程文件的本地缓存"""
         import tempfile
+        import os
         import hashlib
         
         # 创建缓存目录
         cache_dir = os.path.join(tempfile.gettempdir(), "log_cache")
         os.makedirs(cache_dir, exist_ok=True)
         
-        # 计算缓存文件名（使用远程路径的哈希作为文件名）
+        # 计算文件哈希作为缓存文件名
         file_hash = hashlib.md5(remote_path.encode()).hexdigest()
-        file_name = os.path.basename(remote_path)
-        cache_file = os.path.join(cache_dir, f"{file_hash}_{file_name}")
+        file_ext = os.path.splitext(remote_path)[1]
+        cached_file = os.path.join(cache_dir, f"{file_hash}{file_ext}")
         
-        # 如果缓存不存在，则下载
-        if not os.path.exists(cache_file):
-            self.log_message(f"缓存不存在，下载文件: {remote_path}")
-            collector.sftp.get(remote_path, cache_file)
-            self.log_message(f"文件已下载到缓存: {cache_file}")
-        else:
-            self.log_message(f"使用缓存文件: {cache_file}")
+        # 如果缓存文件已存在，直接返回
+        if os.path.exists(cached_file):
+            return cached_file
         
-        return cache_file
+        # 下载文件到缓存目录
+        try:
+            self.log_message(f"下载文件到本地缓存: {os.path.basename(remote_path)}")
+            collector.download_file(remote_path, cached_file)
+            return cached_file
+        except Exception as e:
+            self.log_message(f"下载文件失败: {str(e)}")
+            return None
     
     def _read_file_with_encoding(self, file_path):
-        """尝试多种编码读取文件为行列表"""
-        # 尝试多种编码打开文件
-        encodings = ['gbk', 'utf-8', 'gb18030', 'latin1']
-        file_content = None
+        """尝试不同编码读取文件内容"""
+        encodings = ['utf-8', 'gbk', 'gb2312', 'iso-8859-1']
         
         for encoding in encodings:
             try:
                 with open(file_path, 'r', encoding=encoding) as f:
-                    file_content = f.readlines()
-                self.log_message(f"成功使用编码 {encoding} 打开文件")
-                break
+                    return f.read()
             except UnicodeDecodeError:
                 continue
         
-        if not file_content:
-            # 如果所有编码都失败，使用二进制模式读取并手动处理
-            with open(file_path, 'rb') as f:
-                binary_content = f.read()
-                try:
-                    file_content = binary_content.decode('gbk', errors='ignore').splitlines(True)
-                except:
-                    file_content = binary_content.decode('utf-8', errors='ignore').splitlines(True)
-            self.log_message("使用二进制模式读取文件并手动解码")
-        
-        return file_content
+        # 如果所有编码都失败，使用二进制模式读取
+        with open(file_path, 'rb') as f:
+            binary_content = f.read()
+            return binary_content.decode('utf-8', errors='ignore')
     
     def _read_file_content(self, file_path):
-        """尝试多种编码读取文件为字符串"""
-        # 尝试多种编码打开文件
-        encodings = ['gbk', 'utf-8', 'gb18030', 'latin1']
-        file_content = None
-        
-        for encoding in encodings:
-            try:
-                with open(file_path, 'r', encoding=encoding) as f:
-                    file_content = f.read()
-                self.log_message(f"成功使用编码 {encoding} 打开文件")
-                break
-            except UnicodeDecodeError:
-                continue
-        
-        if not file_content:
-            # 如果所有编码都失败，使用二进制模式读取并手动处理
-            with open(file_path, 'rb') as f:
-                binary_content = f.read()
-                try:
-                    file_content = binary_content.decode('gbk', errors='ignore')
-                except:
-                    file_content = binary_content.decode('utf-8', errors='ignore')
-            self.log_message("使用二进制模式读取文件并手动解码")
-        
-        return file_content
-
+        """读取文件内容，尝试自动检测换行符和编码"""
+        try:
+            # 尝试使用不同的编码读取文件
+            content = self._read_file_with_encoding(file_path)
+            
+            # 检查文件大小，如果超过一定大小，可能会导致UI卡顿
+            if len(content) > 5 * 1024 * 1024:  # 5MB
+                self.log_message("文件较大，仅显示前后部分内容...")
+                lines = content.splitlines()
+                if len(lines) > 2000:
+                    # 只保留前1000行和后1000行
+                    first_part = '\n'.join(lines[:1000])
+                    last_part = '\n'.join(lines[-1000:])
+                    content = first_part + "\n\n...... [文件过大，中间内容已省略] ......\n\n" + last_part
+            
+            return content
+        except Exception as e:
+            self.log_message(f"读取文件内容失败: {str(e)}")
+            return f"无法读取文件内容: {str(e)}"
+    
     def is_local_test_mode(self):
         """检查是否为本地测试模式"""
         return (self.config.get('ssh', {}).get('host') == '127.0.0.1' and 
@@ -1055,286 +1007,239 @@ class LogAnalysisWorker(QThread):
                 self.get_local_log_files()
             elif self.mode == 'search':
                 self.search_local_keyword()
-            elif self.mode == 'get_log':
+            elif self.mode == 'full':
                 self.get_local_full_log()
         except Exception as e:
             self.error.emit(f"本地测试模式出错: {str(e)}")
     
     def get_local_log_files(self):
         """获取本地日志文件列表"""
-        all_logs = []
+        log_files = []
         
+        # 获取日期范围
+        start_date = datetime.strptime(self.config.get('start_date_analysis', ''), '%Y-%m-%d')
+        end_date = datetime.strptime(self.config.get('end_date_analysis', ''), '%Y-%m-%d')
+        end_date = end_date.replace(hour=23, minute=59, second=59)  # 设置为当天结束时间
+        
+        # 遍历所有日志路径
         for path in self.config['log_paths']:
-            try:
-                if os.path.exists(path) and os.path.isdir(path):
-                    # 获取目录中的所有文件
-                    files = [f for f in os.listdir(path) if os.path.isfile(os.path.join(path, f))]
-                    
-                    # 过滤出支持的文件类型
-                    supported_files = []
+            self.log_message(f"获取目录中的日志文件: {path}")
+            
+            if os.path.exists(path) and os.path.isdir(path):
+                # 递归遍历目录
+                for root, dirs, files in os.walk(path):
                     for file in files:
-                        # 检查是否为.log或.zip文件
-                        if file.endswith(('.log', '.zip')):
-                            # 检查日期范围
-                            if 'date_range' in self.config and self.config['date_range'].get('enabled', False):
-                                # 尝试从文件名中提取日期
-                                import re
-                                date_match = re.search(r'(\d{4}-\d{2}-\d{2})', file)
+                        if file.endswith('.log') or file.endswith('.zip'):
+                            file_path = os.path.join(root, file)
+                            
+                            # 尝试从文件名中提取日期
+                            date_match = re.search(r'(\d{4}-\d{2}-\d{2})', file)
+                            if date_match:
+                                file_date_str = date_match.group(1)
+                                try:
+                                    file_date = datetime.strptime(file_date_str, '%Y-%m-%d')
+                                    if not (start_date <= file_date <= end_date):
+                                        continue  # 跳过不在日期范围内的文件
+                                except ValueError:
+                                    pass  # 解析失败，保留文件
+                            
+                            # 获取文件信息
+                            try:
+                                file_stat = os.stat(file_path)
+                                size = file_stat.st_size
+                                if size < 1024:
+                                    size_str = f"{size} B"
+                                elif size < 1024 * 1024:
+                                    size_str = f"{size / 1024:.2f} KB"
+                                else:
+                                    size_str = f"{size / (1024 * 1024):.2f} MB"
                                 
-                                if date_match:
-                                    file_date_str = date_match.group(1)
-                                    try:
-                                        file_date = datetime.strptime(file_date_str, '%Y-%m-%d').date()
-                                        start_date = datetime.strptime(
-                                            self.config['date_range']['start_date'], '%Y-%m-%d').date()
-                                        end_date = datetime.strptime(
-                                            self.config['date_range']['end_date'], '%Y-%m-%d').date()
-                                        
-                                        # 检查日期是否在范围内
-                                        if start_date <= file_date <= end_date:
-                                            full_path = os.path.join(path, file)
-                                            supported_files.append({
-                                                'name': file,
-                                                'path': full_path
-                                            })
-                                    except:
-                                        # 如果日期解析失败，跳过此文件
-                                        continue
-                            else:
-                                # 如果没有日期筛选，直接添加
-                                full_path = os.path.join(path, file)
-                                supported_files.append({
+                                mod_time = datetime.fromtimestamp(file_stat.st_mtime)
+                                date_str = mod_time.strftime('%Y-%m-%d %H:%M:%S')
+                                
+                                log_files.append({
+                                    'path': file_path,
                                     'name': file,
-                                    'path': full_path
+                                    'size': size_str,
+                                    'date': date_str
                                 })
-                    
-                    all_logs.extend(supported_files)
-            except Exception as e:
-                self.error.emit(f"获取本地目录 {path} 中的日志列表失败: {str(e)}")
+                            except:
+                                # 如果获取文件信息失败，使用默认值
+                                log_files.append({
+                                    'path': file_path,
+                                    'name': file,
+                                    'size': '未知',
+                                    'date': '未知'
+                                })
+            else:
+                self.log_message(f"目录不存在: {path}")
         
-        # 发送日志列表信号
-        self.log_list.emit(all_logs)
+        self.log_list.emit(log_files)
     
     def search_local_keyword(self):
         """在本地日志文件中搜索关键字"""
-        try:
-            if not self.log_path or not self.keyword:
-                self.error.emit("未指定日志文件或关键字")
-                return
-            
-            self.log_message(f"准备在本地文件中搜索关键字: '{self.keyword}'")
-            
-            if not os.path.exists(self.log_path):
-                self.error.emit(f"文件不存在: {self.log_path}")
-                return
-            
-            # 搜索关键字
-            found_lines = []
-            matching_records = []  # 存储匹配的完整记录
-            earliest_time = None
-            latest_time = None
-            time_pattern = re.compile(r'(\d{2}:\d{2}:\d{2}(?:\.\d+)?)')
-            file_content = []
-            
-            try:
-                # 尝试多种编码打开文件
-                encodings = ['utf-8', 'gbk', 'gb18030', 'latin1']
-                
-                # 先读取整个文件内容
-                for encoding in encodings:
-                    try:
-                        with open(self.log_path, 'r', encoding=encoding) as f:
-                            file_content = f.readlines()
-                        # 如果成功读取，跳出循环
-                        break
-                    except UnicodeDecodeError:
-                        continue
-                
-                # 如果所有编码都失败，使用二进制模式读取
-                if not file_content and not any(self.log_path.endswith(ext) for ext in ['.zip']):
-                    with open(self.log_path, 'rb') as f:
-                        binary_content = f.read()
-                        text_content = binary_content.decode('utf-8', errors='ignore')
-                        file_content = text_content.splitlines(True)
-                
-                # 处理多行JSON记录和关键字搜索
-                i = 0
-                while i < len(file_content):
-                    line = file_content[i].strip()
-                    
-                    # 检查是否是JSON记录的开始（包含大括号）
-                    if "{" in line and not line.strip().endswith("}"):
-                        record_start = i
-                        record_lines = [line]
-                        json_content = line
-                        
-                        # 尝试继续读取，直到找到匹配的结束大括号
-                        j = i + 1
-                        while j < len(file_content) and "}" not in file_content[j]:
-                            record_lines.append(file_content[j].strip())
-                            json_content += file_content[j]
-                            j += 1
-                        
-                        # 如果找到了结束括号，添加最后一行
-                        if j < len(file_content):
-                            record_lines.append(file_content[j].strip())
-                            json_content += file_content[j]
-                            
-                            # 检查整个JSON是否包含关键字
-                            if self.keyword in json_content:
-                                # 将整个记录标记为匹配项
-                                matching_records.append((record_start, j, record_lines))
-                                
-                                # 尝试从第一行提取时间
-                                first_line = record_lines[0]
-                                time_match = time_pattern.search(first_line)
-                                if time_match:
-                                    time_str = time_match.group(1)
-                                    if earliest_time is None or time_str < earliest_time:
-                                        earliest_time = time_str
-                                    if latest_time is None or time_str > latest_time:
-                                        latest_time = time_str
-                            
-                            i = j  # 跳过整个JSON记录
-                        else:
-                            i += 1  # 如果没有找到结束括号，继续处理下一行
-                    else:
-                        # 处理普通行
-                        if self.keyword in line:
-                            found_lines.append(line)
-                            
-                            # 尝试从行中提取时间
-                            time_match = time_pattern.search(line)
-                            if time_match:
-                                time_str = time_match.group(1)
-                                if earliest_time is None or time_str < earliest_time:
-                                    earliest_time = time_str
-                                if latest_time is None or time_str > latest_time:
-                                    latest_time = time_str
-                        
-                        i += 1
-                
-                # 如果找到了匹配项和时间范围，再次处理以获取这个时间范围内的所有日志
-                total_matches = len(found_lines) + len(matching_records)
-                if total_matches > 0 and earliest_time and latest_time:
-                    all_lines_in_timerange = self._get_full_log_context(file_content, earliest_time, latest_time, time_pattern)
-                    
-                    if all_lines_in_timerange:
-                        self.log_message(f"找到 {total_matches} 个匹配项，时间范围: {earliest_time} - {latest_time}")
-                        self.log_message(f"时间范围内共 {len(all_lines_in_timerange)} 行日志")
-                        self.search_result.emit(self.keyword, all_lines_in_timerange)
-                        return
-                
-                # 如果没有找到时间范围或处理失败，合并匹配的单行和记录
-                if total_matches > 0:
-                    all_matched_lines = found_lines.copy()
-                    for _, _, record_lines in matching_records:
-                        all_matched_lines.extend(record_lines)
-                    
-                    self.log_message(f"找到 {total_matches} 个匹配项")
-                    self.search_result.emit(self.keyword, all_matched_lines)
-                else:
-                    self.log_message("搜索未找到匹配结果")
-                    self.search_result.emit(self.keyword, [])
-            
-            except Exception as e:
-                self.error.emit(f"搜索本地文件失败: {str(e)}")
-                self.search_result.emit(self.keyword, [])
+        if not self.log_path or not self.keyword:
+            self.error.emit("缺少日志文件路径或关键字")
+            return
         
+        try:
+            # 从日志文件路径中提取文件名
+            log_name = os.path.basename(self.log_path)
+            
+            # 检查是否为zip文件
+            if self.log_path.lower().endswith('.zip'):
+                # 读取压缩文件内容
+                import zipfile
+                import tempfile
+                
+                # 创建临时目录存放解压的文件
+                temp_dir = tempfile.mkdtemp()
+                results = []
+                
+                try:
+                    # 解压文件
+                    with zipfile.ZipFile(self.log_path, 'r') as zip_ref:
+                        # 获取zip文件中的所有文件
+                        file_list = zip_ref.namelist()
+                        
+                        # 遍历压缩包中的每个文件
+                        for file_name in file_list:
+                            # 只处理日志文件
+                            if not file_name.lower().endswith('.log'):
+                                continue
+                            
+                            # 解压到临时目录
+                            zip_ref.extract(file_name, temp_dir)
+                            extracted_file = os.path.join(temp_dir, file_name)
+                            
+                            # 读取文件内容
+                            content = self._read_file_content(extracted_file)
+                            
+                            # 搜索关键字
+                            found_lines = []
+                            for i, line in enumerate(content.splitlines()):
+                                if self.keyword.lower() in line.lower():
+                                    found_lines.append({
+                                        'line_num': i + 1,
+                                        'content': line.strip(),
+                                        'file': file_name
+                                    })
+                            
+                            # 如果找到结果，添加到结果列表
+                            if found_lines:
+                                results.extend(found_lines)
+                    
+                    # 发送搜索结果
+                    self.search_result.emit(self.keyword, results)
+                finally:
+                    # 清理临时目录
+                    import shutil
+                    if os.path.exists(temp_dir):
+                        shutil.rmtree(temp_dir)
+            else:
+                # 处理普通日志文件
+                # 读取文件内容
+                content = self._read_file_content(self.log_path)
+                
+                # 搜索关键字
+                results = []
+                for i, line in enumerate(content.splitlines()):
+                    if self.keyword.lower() in line.lower():
+                        results.append({
+                            'line_num': i + 1,
+                            'content': line.strip(),
+                            'file': log_name
+                        })
+                
+                # 发送搜索结果
+                self.search_result.emit(self.keyword, results)
         except Exception as e:
-            self.error.emit(f"本地搜索关键字失败: {str(e)}")
+            self.error.emit(f"搜索关键字时出错: {str(e)}")
     
     def get_local_full_log(self):
-        """获取本地日志完整内容"""
+        """获取本地日志文件的完整内容"""
+        if not self.log_path:
+            self.error.emit("缺少日志文件路径")
+            return
+        
         try:
-            if not self.log_path:
-                self.error.emit("未指定日志文件")
-                return
-            
-            if not os.path.exists(self.log_path):
-                self.error.emit(f"文件不存在: {self.log_path}")
-                return
-            
-            # 检查文件大小
-            file_size = os.path.getsize(self.log_path)
-            if file_size > 10 * 1024 * 1024:  # 大于10MB
-                self.error.emit(f"文件太大 ({file_size/1024/1024:.1f}MB)，请使用关键字搜索缩小范围")
-                return
-            
-            # 读取文件内容
-            try:
-                # 尝试多种编码打开文件
-                encodings = ['utf-8', 'gbk', 'gb18030', 'latin1']
-                log_content = None
+            # 检查是否为zip文件
+            if self.log_path.lower().endswith('.zip'):
+                # 读取压缩文件内容
+                import zipfile
+                import tempfile
                 
-                for encoding in encodings:
-                    try:
-                        with open(self.log_path, 'r', encoding=encoding) as f:
-                            log_content = f.read()
-                        self.log_message(f"成功使用编码 {encoding} 打开文件")
-                        break
-                    except UnicodeDecodeError:
-                        continue
+                # 创建临时目录存放解压的文件
+                temp_dir = tempfile.mkdtemp()
+                full_content = ""
                 
-                # 如果所有编码都失败，使用二进制模式读取
-                if log_content is None:
-                    with open(self.log_path, 'rb') as f:
-                        binary_content = f.read()
-                        log_content = binary_content.decode('utf-8', errors='ignore')
-                    self.log_message("使用二进制模式读取文件并手动解码")
+                try:
+                    # 解压文件
+                    with zipfile.ZipFile(self.log_path, 'r') as zip_ref:
+                        # 获取zip文件中的所有文件
+                        file_list = zip_ref.namelist()
+                        
+                        # 遍历压缩包中的每个文件
+                        for file_name in file_list:
+                            # 只处理日志文件
+                            if not file_name.lower().endswith('.log'):
+                                continue
+                            
+                            # 解压到临时目录
+                            zip_ref.extract(file_name, temp_dir)
+                            extracted_file = os.path.join(temp_dir, file_name)
+                            
+                            # 读取文件内容
+                            content = self._read_file_content(extracted_file)
+                            
+                            # 添加文件名标题
+                            full_content += f"\n\n===== {file_name} =====\n\n"
+                            full_content += content
+                    
+                    # 发送完整日志内容
+                    self.complete_log.emit(full_content)
+                finally:
+                    # 清理临时目录
+                    import shutil
+                    if os.path.exists(temp_dir):
+                        shutil.rmtree(temp_dir)
+            else:
+                # 处理普通日志文件
+                # 读取文件内容
+                content = self._read_file_content(self.log_path)
                 
-                # 发送完整日志信号
-                self.complete_log.emit(log_content)
-            
-            except Exception as e:
-                self.error.emit(f"读取本地文件失败: {str(e)}")
-        
+                # 发送完整日志内容
+                self.complete_log.emit(content)
         except Exception as e:
-            self.error.emit(f"获取本地日志内容失败: {str(e)}")
-
+            self.error.emit(f"获取完整日志时出错: {str(e)}")
+    
     def _get_full_log_context(self, file_content, earliest_time, latest_time, time_pattern):
-        """获取完整日志上下文，包括处理多行JSON结构"""
-        all_lines_in_timerange = []
-        i = 0
+        """获取指定时间范围内的日志上下文"""
+        lines = file_content.splitlines()
+        result_lines = []
         
-        while i < len(file_content):
-            line = file_content[i].strip()
-            
-            # 检查是否包含时间
-            time_match = time_pattern.search(line)
-            in_time_range = False
-            
-            if time_match:
-                time_str = time_match.group(1)
-                in_time_range = earliest_time <= time_str <= latest_time
-            
-            # 如果在时间范围内
-            if in_time_range:
-                # 检查是否是JSON记录的开始（包含大括号）
-                if "{" in line and not line.strip().endswith("}"):
-                    # 这是一个多行JSON记录的开始
-                    record_lines = [line]
+        # 尝试匹配每行的时间戳
+        for line in lines:
+            match = re.search(time_pattern, line)
+            if match:
+                try:
+                    # 解析时间戳
+                    time_str = match.group(1)
+                    time = datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S')
                     
-                    # 继续读取，直到找到匹配的结束大括号
-                    j = i + 1
-                    while j < len(file_content) and "}" not in file_content[j]:
-                        record_lines.append(file_content[j].strip())
-                        j += 1
-                    
-                    # 如果找到了结束括号，添加最后一行
-                    if j < len(file_content):
-                        record_lines.append(file_content[j].strip())
-                        # 将整个记录添加到结果中
-                        all_lines_in_timerange.extend(record_lines)
-                        i = j + 1  # 跳过整个JSON记录
-                        continue
-                else:
-                    # 普通行，直接添加
-                    all_lines_in_timerange.append(line)
-            
-            i += 1
+                    # 检查是否在时间范围内
+                    if earliest_time <= time <= latest_time:
+                        result_lines.append(line)
+                except:
+                    # 如果解析失败，保留这行（可能是多行日志的一部分）
+                    if result_lines:
+                        result_lines.append(line)
+            else:
+                # 如果没有时间戳，可能是上一条日志的延续
+                if result_lines:
+                    result_lines.append(line)
         
-        return all_lines_in_timerange
+        return '\n'.join(result_lines)
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -1404,13 +1309,13 @@ class MainWindow(QMainWindow):
         ssh_layout.addLayout(host_layout)
         ssh_layout.addLayout(credentials_layout)
         
-        # 创建选项卡窗口
-        self.tab_widget = QTabWidget()
-        self.tab_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        # 创建功能选项卡容器
+        function_tabs = QTabWidget()
+        function_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         
-        # 创建日志收集选项卡
-        collection_tab = QWidget()
-        collection_layout = QVBoxLayout(collection_tab)
+        # 创建日志收集页
+        collect_tab = QWidget()
+        collect_layout = QVBoxLayout(collect_tab)
         
         # 日期选择
         date_group = QGroupBox("日期设置")
@@ -1445,7 +1350,7 @@ class MainWindow(QMainWindow):
         date_layout.addLayout(date_range_layout)
         
         # 添加日期说明
-        date_info = QLabel("注意：将自动匹配文件名中包含选定日期范围的日志文件\n支持的文件名格式：xxxx_YYYY-MM-DD.log 或 xxxx_YYYY-MM-DD.zip")
+        date_info = QLabel("注意：将自动匹配文件名中包含选定日期范围的日志文件支持的文件名格式：xxxx_YYYY-MM-DD.log 或 xxxx_YYYY-MM-DD.zip")
         date_info.setStyleSheet("color: gray;")
         date_layout.addWidget(date_info)
         
@@ -1454,7 +1359,7 @@ class MainWindow(QMainWindow):
         path_layout = QVBoxLayout(path_group)
         
         # 添加路径说明
-        path_info = QLabel("请输入日志文件所在的目录，程序会自动查找并下载符合日期条件的日志文件\n支持的文件类型：.log 和 .zip")
+        path_info = QLabel("请输入日志文件所在的目录，程序会自动查找并下载符合日期条件的日志文件支持的文件类型：.log 和 .zip")
         path_info.setStyleSheet("color: gray;")
         path_layout.addWidget(path_info)
         
@@ -1492,212 +1397,166 @@ class MainWindow(QMainWindow):
         add_path_btn.clicked.connect(self.add_path)
         remove_path_btn.clicked.connect(self.remove_path)
         
+        # 文件列表和操作区域合并
+        file_list_group = QGroupBox("文件列表和操作")
+        file_list_layout = QVBoxLayout(file_list_group)
+        
+        # 操作按钮区域
+        operations_layout = QHBoxLayout()
+        
+        # 创建操作按钮
+        list_btn = QPushButton("列出文件")
+        collect_btn = QPushButton("收集日志")
+        operations_layout.addWidget(list_btn)
+        operations_layout.addWidget(collect_btn)
+        operations_layout.addStretch(1)
+        
+        # 添加操作按钮区域到文件列表布局
+        file_list_layout.addLayout(operations_layout)
+        
+        # 文件列表视图
+        self.file_list = QTableWidget()
+        self.file_list.setColumnCount(3)
+        self.file_list.setHorizontalHeaderLabels(["文件名", "大小", "日期"])
+        self.file_list.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.file_list.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.file_list.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        file_list_layout.addWidget(self.file_list)
+        
+        # 连接按钮事件
+        list_btn.clicked.connect(self.list_files)
+        collect_btn.clicked.connect(self.start_collection)
+        
         # 进度显示
+        progress_group = QGroupBox("进度")
+        progress_layout = QVBoxLayout(progress_group)
+        
         self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%v / %m KB (%p%)")
+        progress_layout.addWidget(self.progress_bar)
         
-        # 日志显示
-        log_group = QGroupBox("操作日志")
-        log_layout = QVBoxLayout(log_group)
-        self.log_display = QTextEdit()
-        self.log_display.setReadOnly(True)
-        log_layout.addWidget(self.log_display)
+        # 将各组件添加到收集选项卡
+        collect_layout.addWidget(date_group)
+        collect_layout.addWidget(path_group)
+        collect_layout.addWidget(file_list_group)
+        collect_layout.addWidget(progress_group)
         
-        # 操作按钮
-        button_layout = QHBoxLayout()
-        list_files_btn = QPushButton("列出最新文件")
-        list_files_btn.clicked.connect(self.list_files)
-        self.start_button = QPushButton("开始收集")
-        self.start_button.clicked.connect(self.start_collection)
-        button_layout.addWidget(list_files_btn)
-        button_layout.addWidget(self.start_button)
-        
-        # 将组件添加到日志收集选项卡
-        collection_layout.addWidget(date_group)
-        collection_layout.addWidget(path_group)
-        collection_layout.addWidget(self.progress_bar)
-        collection_layout.addWidget(log_group)
-        collection_layout.addLayout(button_layout)
-        
-        # 创建日志分析选项卡
+        # 创建日志分析页
         analysis_tab = QWidget()
         analysis_layout = QVBoxLayout(analysis_tab)
         
-        # 创建分析选项卡的主分割器（上下布局）
-        main_splitter = QSplitter(Qt.Orientation.Vertical)
-        main_splitter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        # 时间范围选择
+        analysis_date_group = QGroupBox("时间范围选择")
+        analysis_date_layout = QHBoxLayout(analysis_date_group)
         
-        # 上半部分：日期选择和日志列表（并列布局）
-        upper_widget = QWidget()
-        upper_layout = QHBoxLayout(upper_widget)  # 改为水平布局
+        analysis_start_date_label = QLabel("开始日期:")
+        self.analysis_start_date = QDateEdit()
+        self.analysis_start_date.setDate(QDate.currentDate().addDays(-1))
+        self.analysis_start_date.setCalendarPopup(True)
         
-        # 左侧：日期设置部分
-        date_container = QWidget()
-        date_container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
-        date_container_layout = QVBoxLayout(date_container)
+        analysis_end_date_label = QLabel("结束日期:")
+        self.analysis_end_date = QDateEdit()
+        self.analysis_end_date.setDate(QDate.currentDate())
+        self.analysis_end_date.setCalendarPopup(True)
         
-        # 创建日期范围选择
-        date_group_analysis = QGroupBox("日期设置")
-        date_layout_analysis = QVBoxLayout(date_group_analysis)
+        list_logs_btn = QPushButton("获取日志列表")
         
-        # 日期范围选择
-        date_range_layout_analysis = QHBoxLayout()
-        self.use_date_range_analysis = QCheckBox("使用日期范围")
-        self.use_date_range_analysis.setChecked(True)
-        date_range_layout_analysis.addWidget(self.use_date_range_analysis)
+        analysis_date_layout.addWidget(analysis_start_date_label)
+        analysis_date_layout.addWidget(self.analysis_start_date)
+        analysis_date_layout.addWidget(analysis_end_date_label)
+        analysis_date_layout.addWidget(self.analysis_end_date)
+        analysis_date_layout.addWidget(list_logs_btn)
+        analysis_date_layout.addStretch(1)
         
-        # 开始日期
-        start_date_layout_analysis = QHBoxLayout()
-        start_date_label_analysis = QLabel("开始日期:")
-        self.start_date_analysis = QDateEdit()
-        self.start_date_analysis.setDate(QDate.currentDate().addDays(-1))  # 默认昨天
-        self.start_date_analysis.setCalendarPopup(True)
-        start_date_layout_analysis.addWidget(start_date_label_analysis)
-        start_date_layout_analysis.addWidget(self.start_date_analysis)
+        # 连接按钮事件
+        list_logs_btn.clicked.connect(self.get_log_list)
         
-        # 结束日期
-        end_date_layout_analysis = QHBoxLayout()
-        end_date_label_analysis = QLabel("结束日期:")
-        self.end_date_analysis = QDateEdit()
-        self.end_date_analysis.setDate(QDate.currentDate())  # 默认今天
-        self.end_date_analysis.setCalendarPopup(True)
-        end_date_layout_analysis.addWidget(end_date_label_analysis)
-        end_date_layout_analysis.addWidget(self.end_date_analysis)
-        
-        date_range_layout_analysis.addLayout(start_date_layout_analysis)
-        date_range_layout_analysis.addLayout(end_date_layout_analysis)
-        date_layout_analysis.addLayout(date_range_layout_analysis)
-        
-        # 获取日志列表按钮
-        logs_btn_layout = QHBoxLayout()
-        get_logs_btn = QPushButton("获取日志列表")
-        get_logs_btn.clicked.connect(self.get_log_list)
-        logs_btn_layout.addWidget(get_logs_btn)
-        logs_btn_layout.addStretch(1)
-        date_layout_analysis.addLayout(logs_btn_layout)
-        
-        date_container_layout.addWidget(date_group_analysis)
-        date_container_layout.addStretch(1)  # 添加弹性空间，使日期控件在顶部
-        
-        # 右侧：日志列表框
-        log_list_container = QWidget()
-        log_list_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        log_list_layout = QVBoxLayout(log_list_container)
-        
+        # 日志文件列表
         log_list_group = QGroupBox("日志文件列表")
-        log_list_inner_layout = QVBoxLayout(log_list_group)
+        log_list_layout = QVBoxLayout(log_list_group)
         
-        self.log_list_widget = QListWidget()
-        self.log_list_widget.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
-        log_list_inner_layout.addWidget(self.log_list_widget)
+        self.log_list = QTableWidget()
+        self.log_list.setColumnCount(3)
+        self.log_list.setHorizontalHeaderLabels(["日志名称", "大小", "日期"])
+        self.log_list.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.log_list.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
+        self.log_list.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.log_list.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         
-        log_list_layout.addWidget(log_list_group)
+        log_list_layout.addWidget(self.log_list)
         
-        # 将左右两部分添加到上半部分布局
-        upper_layout.addWidget(date_container, 1)  # 1是拉伸因子
-        upper_layout.addWidget(log_list_container, 3)  # 日志列表占更多空间
+        # 搜索区域
+        search_group = QGroupBox("关键字搜索")
+        search_layout = QVBoxLayout(search_group)
         
-        # 中间部分：关键字搜索
-        middle_widget = QWidget()
-        middle_layout = QVBoxLayout(middle_widget)
-        middle_layout.setContentsMargins(0, 0, 0, 0)  # 减小边距
-        
-        # 关键字搜索
-        keyword_group = QGroupBox("关键字搜索")
-        keyword_layout = QVBoxLayout(keyword_group)
-        keyword_layout.setContentsMargins(9, 9, 9, 9)  # 减小内边距
-        
-        keyword_input_layout = QHBoxLayout()
+        search_input_layout = QHBoxLayout()
         keyword_label = QLabel("关键字:")
         self.keyword_input = QLineEdit()
         self.keyword_input.setPlaceholderText("输入要搜索的关键字")
         search_btn = QPushButton("搜索")
-        search_btn.clicked.connect(self.search_keyword)
         view_full_btn = QPushButton("查看完整日志")
+        
+        search_input_layout.addWidget(keyword_label)
+        search_input_layout.addWidget(self.keyword_input)
+        search_input_layout.addWidget(search_btn)
+        search_input_layout.addWidget(view_full_btn)
+        
+        # 连接按钮事件
+        search_btn.clicked.connect(self.search_keyword)
         view_full_btn.clicked.connect(self.view_full_log)
         
-        keyword_input_layout.addWidget(keyword_label)
-        keyword_input_layout.addWidget(self.keyword_input)
-        keyword_input_layout.addWidget(search_btn)
-        keyword_input_layout.addWidget(view_full_btn)
+        search_layout.addLayout(search_input_layout)
         
-        keyword_layout.addLayout(keyword_input_layout)
-        middle_layout.addWidget(keyword_group)
+        # 搜索结果区域
+        self.result_text = QTextEdit()
+        self.result_text.setReadOnly(True)
         
-        # 下半部分：搜索结果和操作日志（并列布局）
-        lower_widget = QWidget()
-        lower_layout = QHBoxLayout(lower_widget)  # 水平布局
+        search_layout.addWidget(self.result_text)
         
-        # 左侧：搜索结果
-        result_group = QGroupBox("搜索结果")
-        result_layout = QVBoxLayout(result_group)
+        # 添加导出结果和导出时间范围日志的按钮
+        export_btns_layout = QHBoxLayout()
+        export_btn = QPushButton("导出搜索结果")
+        export_time_range_btn = QPushButton("导出时间范围日志")
         
-        self.result_display = QTextEdit()
-        self.result_display.setReadOnly(True)
-        result_layout.addWidget(self.result_display)
+        export_btns_layout.addWidget(export_btn)
+        export_btns_layout.addWidget(export_time_range_btn)
+        export_btns_layout.addStretch(1)
         
-        # 导出按钮
-        export_layout = QHBoxLayout()
-        export_btn = QPushButton("导出结果")
+        search_layout.addLayout(export_btns_layout)
+        
+        # 连接导出按钮事件
         export_btn.clicked.connect(self.export_results)
+        export_time_range_btn.clicked.connect(self.export_time_range_logs)
         
-        # 添加清除缓存按钮
-        clear_cache_btn = QPushButton("清除缓存")
-        clear_cache_btn.clicked.connect(self.clear_log_cache)
+        # 将各组件添加到分析选项卡
+        analysis_layout.addWidget(analysis_date_group)
+        analysis_layout.addWidget(log_list_group)
+        analysis_layout.addWidget(search_group)
         
-        export_layout.addStretch(1)  # 推动按钮到右侧
-        export_layout.addWidget(export_btn)
-        export_layout.addWidget(clear_cache_btn)
+        # 添加两个选项卡到功能选项卡容器
+        function_tabs.addTab(collect_tab, "日志收集")
+        function_tabs.addTab(analysis_tab, "日志分析")
         
-        result_layout.addLayout(export_layout)
+        # 消息区域
+        log_group = QGroupBox("操作日志")
+        log_layout = QVBoxLayout(log_group)
         
-        # 右侧：操作日志记录
-        analysis_log_group = QGroupBox("操作日志")
-        analysis_log_layout = QVBoxLayout(analysis_log_group)
-        analysis_log_layout.setContentsMargins(9, 9, 9, 9)  # 减小内边距
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        log_layout.addWidget(self.log_text)
         
-        self.analysis_log_display = QTextEdit()
-        self.analysis_log_display.setReadOnly(True)
-        analysis_log_layout.addWidget(self.analysis_log_display)
-        
-        # 添加到下半部分布局
-        lower_layout.addWidget(result_group, 3)  # 搜索结果占更多空间
-        lower_layout.addWidget(analysis_log_group, 1)
-        
-        # 将所有部分添加到主分割器
-        main_splitter.addWidget(upper_widget)
-        main_splitter.addWidget(middle_widget)
-        main_splitter.addWidget(lower_widget)
-        
-        # 设置初始大小比例
-        main_splitter.setSizes([300, 80, 400])  # 上半部分更大，中间部分更小
-        
-        # 将主分割器添加到分析布局
-        analysis_layout.addWidget(main_splitter)
-        
-        # 更新分析选项卡
-        analysis_tab.setLayout(analysis_layout)
-        
-        # 添加选项卡
-        self.tab_widget.addTab(collection_tab, "日志收集")
-        self.tab_widget.addTab(analysis_tab, "日志分析")
-        
-        # 添加所有组件到主布局
+        # 将选项卡和其他组件添加到主布局
         main_layout.addWidget(host_select_group)
         main_layout.addWidget(ssh_group)
-        main_layout.addWidget(self.tab_widget)
+        main_layout.addWidget(function_tabs)
+        main_layout.addWidget(log_group)
         
-        # 设置所有组件为自适应大小
-        host_select_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
-        ssh_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
-        date_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
-        path_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        log_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        
-        # 加载配置
-        self.load_config()
-        # 加载主机列表
+        # 加载主机数据和配置
         self.load_hosts_data()
+        
+        # 显示初始消息
+        self.log_message("程序已启动，请选择或配置主机信息")
     
     def create_menu_bar(self):
         """创建菜单栏"""
@@ -1883,7 +1742,7 @@ class MainWindow(QMainWindow):
         try:
             # 获取配置文件保存路径
             if getattr(sys, 'frozen', False):
-                # 如果是打包后的exe，保存在exe所在目录
+                # 如果是打包后的exe
                 base_path = os.path.dirname(sys.executable)
             else:
                 # 如果是开发环境
@@ -1892,11 +1751,12 @@ class MainWindow(QMainWindow):
             config_path = os.path.join(base_path, 'config.yaml')
             
             with open(config_path, 'w', encoding='utf-8') as f:
-                yaml.dump(config, f, allow_unicode=True)
+                yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
         except Exception as e:
-            self.log_message(f"保存配置文件失败: {str(e)}")
+            self.log_message(f"保存配置失败: {str(e)}")
     
     def add_path(self):
+        """添加日志路径"""
         dialog = PathInputDialog(self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             path = dialog.get_path()
@@ -1904,37 +1764,689 @@ class MainWindow(QMainWindow):
                 self.path_list.addItem(path)
     
     def remove_path(self):
-        current_item = self.path_list.currentItem()
-        if current_item:
-            self.path_list.takeItem(self.path_list.row(current_item))
+        """删除选中的路径"""
+        selected_items = self.path_list.selectedItems()
+        for item in selected_items:
+            self.path_list.takeItem(self.path_list.row(item))
     
     def log_message(self, message):
-        """添加日志消息到日志显示框"""
-        time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        formatted_message = f"{time_str} {message}"
-        # 添加到日志收集选项卡的日志显示框
-        self.log_display.append(formatted_message)
-        # 添加到日志分析选项卡的日志显示框（如果已创建）
-        if hasattr(self, 'analysis_log_display'):
-            self.analysis_log_display.append(formatted_message)
+        """添加日志消息"""
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        self.log_text.append(f"[{timestamp}] {message}")
+        # 滚动到底部
+        self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
     
     def get_date_range(self):
-        if self.use_date_range.isChecked():
-            start_date = self.start_date.date().toPyDate()
-            end_date = self.end_date.date().toPyDate()
-            return start_date, end_date
-        return None, None
+        """获取日期范围设置"""
+        if not self.use_date_range.isChecked():
+            return None, None
+        
+        start_date = self.start_date.date().toString('yyyy-MM-dd')
+        end_date = self.end_date.date().toString('yyyy-MM-dd')
+        return start_date, end_date
     
     def list_files(self):
-        if not self.host_input.text() or not self.username_input.text():
-            QMessageBox.warning(self, "错误", "请填写主机地址和用户名")
+        """列出远程服务器上的日志文件"""
+        # 获取SSH连接配置
+        config = {
+            'ssh': {
+                'host': self.host_input.text(),
+                'port': self.port_input.value(),
+                'username': self.username_input.text(),
+                'password': self.password_input.text()
+            },
+            'log_paths': [self.path_list.item(i).text() 
+                          for i in range(self.path_list.count())]
+        }
+        
+        # 检查配置是否完整
+        if not config['ssh']['host'] or not config['ssh']['username'] or not config['ssh']['password']:
+            QMessageBox.warning(self, "配置不完整", "请填写SSH连接信息")
             return
         
-        if self.path_list.count() == 0:
-            QMessageBox.warning(self, "错误", "请添加至少一个日志文件路径")
+        if not config['log_paths']:
+            QMessageBox.warning(self, "配置不完整", "请添加至少一个日志路径")
             return
         
-        # 准备配置
+        # 清空文件列表
+        self.file_list.setRowCount(0)
+        
+        # 创建并启动工作线程
+        self.log_message("开始列出文件...")
+        self.worker = LogCollectorWorker(config, mode='list')
+        self.worker.file_list.connect(self.show_file_list)
+        self.worker.error.connect(self.collection_error)
+        self.worker.start()
+    
+    def show_file_list(self, file_info_list):
+        """显示文件列表"""
+        self.file_list.setRowCount(len(file_info_list))
+        
+        for row, file_info in enumerate(file_info_list):
+            # 文件名
+            name_item = QTableWidgetItem(file_info.get('name', ''))
+            self.file_list.setItem(row, 0, name_item)
+            
+            # 文件大小（如果有）
+            size_item = QTableWidgetItem(file_info.get('size', 'N/A'))
+            self.file_list.setItem(row, 1, size_item)
+            
+            # 日期
+            date_item = QTableWidgetItem(file_info.get('date', ''))
+            self.file_list.setItem(row, 2, date_item)
+            
+            # 存储完整路径
+            name_item.setData(Qt.ItemDataRole.UserRole, file_info.get('path'))
+        
+        self.log_message(f"列出了 {len(file_info_list)} 个文件")
+    
+    def start_collection(self):
+        """开始收集日志"""
+        # 获取SSH连接配置
+        config = {
+            'ssh': {
+                'host': self.host_input.text(),
+                'port': self.port_input.value(),
+                'username': self.username_input.text(),
+                'password': self.password_input.text()
+            },
+            'log_paths': [self.path_list.item(i).text() 
+                          for i in range(self.path_list.count())]
+        }
+        
+        # 检查配置是否完整
+        if not config['ssh']['host'] or not config['ssh']['username'] or not config['ssh']['password']:
+            QMessageBox.warning(self, "配置不完整", "请填写SSH连接信息")
+            return
+        
+        if not config['log_paths']:
+            QMessageBox.warning(self, "配置不完整", "请添加至少一个日志路径")
+            return
+        
+        # 添加日期范围设置
+        start_date, end_date = self.get_date_range()
+        if start_date and end_date:
+            config['use_date_range'] = True
+            config['start_date'] = start_date
+            config['end_date'] = end_date
+        else:
+            config['use_date_range'] = False
+        
+        # 创建并启动工作线程
+        self.log_message("开始收集日志...")
+        self.worker = LogCollectorWorker(config, mode='collect')
+        self.worker.progress.connect(self.update_progress)
+        self.worker.finished.connect(self.collection_finished)
+        self.worker.error.connect(self.collection_error)
+        self.worker.start()
+        
+        # 保存配置
+        self.save_config()
+    
+    def update_progress(self, filename, current, total):
+        """更新进度条"""
+        self.progress_bar.setMaximum(int(total / 1024))
+        self.progress_bar.setValue(int(current / 1024))
+        
+        # 更新进度条文本
+        progress_text = f"{filename} - {current / 1024:.2f} / {total / 1024:.2f} KB ({current / total * 100:.2f}%)"
+        self.log_message(progress_text)
+    
+    def collection_finished(self, zip_path):
+        """收集完成的处理"""
+        self.log_message(f"日志收集完成，保存在: {zip_path}")
+        QMessageBox.information(self, "收集完成", f"日志收集完成，保存在:\n{zip_path}")
+        
+        # 清除进度条
+        self.progress_bar.setValue(0)
+    
+    def collection_error(self, error_message):
+        """错误处理"""
+        self.log_message(f"错误: {error_message}")
+        QMessageBox.critical(self, "错误", error_message)
+    
+    def get_log_list(self):
+        """获取日志文件列表"""
+        # 获取SSH连接配置
+        config = {
+            'ssh': {
+                'host': self.host_input.text(),
+                'port': self.port_input.value(),
+                'username': self.username_input.text(),
+                'password': self.password_input.text()
+            },
+            'log_paths': [self.path_list.item(i).text() 
+                          for i in range(self.path_list.count())]
+        }
+        
+        # 检查配置是否完整
+        if not config['ssh']['host'] or not config['ssh']['username'] or not config['ssh']['password']:
+            QMessageBox.warning(self, "配置不完整", "请填写SSH连接信息")
+            return
+        
+        if not config['log_paths']:
+            QMessageBox.warning(self, "配置不完整", "请添加至少一个日志路径")
+            return
+        
+        # 添加日期范围设置
+        start_date = self.analysis_start_date.date().toString('yyyy-MM-dd')
+        end_date = self.analysis_end_date.date().toString('yyyy-MM-dd')
+        config['start_date_analysis'] = start_date
+        config['end_date_analysis'] = end_date
+        
+        # 清空日志列表
+        self.log_list.setRowCount(0)
+        
+        # 创建并启动工作线程
+        self.log_message("正在获取日志文件列表...")
+        self.analysis_worker = LogAnalysisWorker(config, mode='list')
+        self.analysis_worker.log_list.connect(self.display_log_list)
+        self.analysis_worker.error.connect(self.analysis_error)
+        self.analysis_worker.log_message_signal.connect(self.log_message)
+        self.analysis_worker.start()
+    
+    def get_date_range_analysis(self):
+        """获取分析选项卡的日期范围设置"""
+        start_date = self.analysis_start_date.date().toString('yyyy-MM-dd')
+        end_date = self.analysis_end_date.date().toString('yyyy-MM-dd')
+        return start_date, end_date
+    
+    def display_log_list(self, logs):
+        """显示日志文件列表"""
+        self.log_list.setRowCount(len(logs))
+        
+        for row, log in enumerate(logs):
+            # 文件名
+            name_item = QTableWidgetItem(log.get('name', ''))
+            self.log_list.setItem(row, 0, name_item)
+            
+            # 文件大小
+            size_item = QTableWidgetItem(log.get('size', ''))
+            self.log_list.setItem(row, 1, size_item)
+            
+            # 日期
+            date_item = QTableWidgetItem(log.get('date', ''))
+            self.log_list.setItem(row, 2, date_item)
+            
+            # 存储完整路径
+            name_item.setData(Qt.ItemDataRole.UserRole, log.get('path'))
+        
+        self.log_message(f"找到 {len(logs)} 个日志文件")
+    
+    def search_keyword(self):
+        """搜索关键字"""
+        # 获取关键字
+        keyword = self.keyword_input.text().strip()
+        if not keyword:
+            QMessageBox.warning(self, "警告", "请输入要搜索的关键字")
+            return
+        
+        # 获取选中的日志文件
+        selected_rows = self.log_list.selectionModel().selectedRows()
+        if not selected_rows:
+            QMessageBox.warning(self, "警告", "请先选择要搜索的日志文件")
+            return
+        
+        # 获取选中文件的路径和文件名
+        selected_files = []
+        file_prefixes = {}  # 用于存储文件前缀
+        file_names = {}     # 用于存储文件名
+        for row in selected_rows:
+            file_name = self.log_list.item(row.row(), 0).text()
+            file_path = self.log_list.item(row.row(), 0).data(Qt.ItemDataRole.UserRole)
+            if file_path:
+                selected_files.append(file_path)
+                # 提取文件前缀，例如从 "RsuLogic_2025-03-31.log" 提取 "RsuLogic"
+                file_prefix = re.match(r'([^_]+)_?', file_name)
+                prefix = file_prefix.group(1) if file_prefix else "LOG"
+                file_prefixes[file_path] = prefix
+                file_names[file_path] = file_name
+        
+        # 清空结果显示区
+        self.result_text.clear()
+        
+        # 创建进度对话框
+        progress = QProgressDialog("正在搜索关键字...", "取消", 0, len(selected_files), self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+        
+        # 开始搜索
+        try:
+            self.log_message("开始搜索关键字: " + keyword)
+            keyword_results = []  # 包含关键字的结果
+            all_file_contents = {}  # 存储每个文件的完整内容
+            time_pattern = r'(\d{2}:\d{2}:\d{2}\.\d{3})'  # 精确匹配时间格式 HH:MM:SS.mmm
+            earliest_time = None
+            latest_time = None
+            
+            # 初始化SSH连接（如果需要搜索远程文件）
+            for i, file_path in enumerate(selected_files):
+                # 更新进度
+                progress.setValue(i)
+                if progress.wasCanceled():
+                    break
+                
+                # 获取文件前缀和文件名
+                prefix = file_prefixes.get(file_path, "LOG")
+                file_name = file_names.get(file_path, os.path.basename(file_path))
+                
+                # 判断是否为本地文件
+                if os.path.exists(file_path):
+                    # 处理本地文件
+                    # 检查文件是否为压缩文件
+                    if file_path.endswith('.zip'):
+                        # 处理压缩文件
+                        with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                            for name in zip_ref.namelist():
+                                # 为zip内每个文件提取前缀
+                                name_prefix = re.match(r'([^_]+)_?', os.path.basename(name))
+                                inner_prefix = name_prefix.group(1) if name_prefix else prefix
+                                
+                                with zip_ref.open(name) as f:
+                                    # 尝试不同的编码读取zip文件内容
+                                    try:
+                                        content_lines = []
+                                        for line in io.TextIOWrapper(f, encoding='utf-8'):
+                                            content_lines.append(line.strip())
+                                            if keyword in line:
+                                                # 提取时间并更新最早/最晚时间
+                                                time_match = re.search(time_pattern, line)
+                                                if time_match:
+                                                    time_str = time_match.group(1)
+                                                    time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                                                    
+                                                    if earliest_time is None or time_obj < earliest_time:
+                                                        earliest_time = time_obj
+                                                    if latest_time is None or time_obj > latest_time:
+                                                        latest_time = time_obj
+                                                
+                                                # 只显示文件名，不显示完整路径
+                                                keyword_results.append(f"[{inner_prefix}] {line.strip()}")
+                                        
+                                        # 存储文件内容
+                                        all_file_contents[f"{file_path}/{name}"] = {
+                                            'content': content_lines, 
+                                            'prefix': inner_prefix,
+                                            'file_name': os.path.basename(name)
+                                        }
+                                    except UnicodeDecodeError:
+                                        # 如果UTF-8失败，尝试GBK
+                                        f.seek(0)  # 重置文件指针
+                                        try:
+                                            content_lines = []
+                                            for line in io.TextIOWrapper(f, encoding='gbk'):
+                                                content_lines.append(line.strip())
+                                                if keyword in line:
+                                                    # 提取时间并更新
+                                                    time_match = re.search(time_pattern, line)
+                                                    if time_match:
+                                                        time_str = time_match.group(1)
+                                                        time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                                                        
+                                                        if earliest_time is None or time_obj < earliest_time:
+                                                            earliest_time = time_obj
+                                                        if latest_time is None or time_obj > latest_time:
+                                                            latest_time = time_obj
+                                                    
+                                                    keyword_results.append(f"[{inner_prefix}] {line.strip()}")
+                                            
+                                            # 存储文件内容
+                                            all_file_contents[f"{file_path}/{name}"] = {
+                                                'content': content_lines, 
+                                                'prefix': inner_prefix,
+                                                'file_name': os.path.basename(name)
+                                            }
+                                        except UnicodeDecodeError:
+                                            # 如果GBK也失败，使用Latin1（可处理任何字节）
+                                            f.seek(0)
+                                            content_lines = []
+                                            for line in io.TextIOWrapper(f, encoding='latin1'):
+                                                content_lines.append(line.strip())
+                                                if keyword in line:
+                                                    # 提取时间并更新
+                                                    time_match = re.search(time_pattern, line)
+                                                    if time_match:
+                                                        time_str = time_match.group(1)
+                                                        time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                                                        
+                                                        if earliest_time is None or time_obj < earliest_time:
+                                                            earliest_time = time_obj
+                                                        if latest_time is None or time_obj > latest_time:
+                                                            latest_time = time_obj
+                                                    
+                                                    keyword_results.append(f"[{inner_prefix}] {line.strip()}")
+                                            
+                                            # 存储文件内容
+                                            all_file_contents[f"{file_path}/{name}"] = {
+                                                'content': content_lines, 
+                                                'prefix': inner_prefix,
+                                                'file_name': os.path.basename(name)
+                                            }
+                                            # 如果成功读取，跳出循环
+                                            break
+                    else:
+                        # 处理普通文本文件，尝试多种编码
+                        encodings = ['utf-8', 'gbk', 'gb18030', 'latin1']
+                        file_content = None
+                        
+                        # 依次尝试不同的编码
+                        for encoding in encodings:
+                            try:
+                                with open(file_path, 'r', encoding=encoding) as f:
+                                    file_content = f.readlines()
+                                self.log_message(f"成功使用 {encoding} 编码读取文件")
+                                # 如果成功读取，跳出循环
+                                break
+                            except UnicodeDecodeError:
+                                self.log_message(f"{encoding} 编码读取失败，尝试下一种编码")
+                                continue
+                            except Exception as e:
+                                self.log_message(f"读取文件时出错 ({encoding}): {str(e)}")
+                        
+                        # 如果所有编码都失败，使用二进制模式读取并强制解码
+                        if not file_content:
+                            try:
+                                self.log_message("尝试二进制模式读取文件")
+                                with open(file_path, 'rb') as f:
+                                    binary_content = f.read()
+                                    text_content = binary_content.decode('utf-8', errors='ignore')
+                                    file_content = text_content.splitlines(True)
+                            except Exception as e:
+                                self.log_message(f"二进制模式读取失败: {str(e)}")
+                                # 最后的尝试，使用最宽松的解码方式
+                                try:
+                                    with open(file_path, 'r', encoding='latin1') as f:
+                                        file_content = f.readlines()
+                                    self.log_message("使用latin1编码成功读取文件")
+                                except Exception as e:
+                                    self.log_message(f"所有读取方式都失败: {str(e)}")
+                                    continue
+                        
+                        # 存储文件内容并搜索匹配行
+                        if file_content:
+                            content_lines = []
+                            for line in file_content:
+                                line = line.strip()
+                                content_lines.append(line)
+                                if keyword in line:
+                                    # 提取时间并更新最早/最晚时间
+                                    time_match = re.search(time_pattern, line)
+                                    if time_match:
+                                        time_str = time_match.group(1)
+                                        time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                                        
+                                        if earliest_time is None or time_obj < earliest_time:
+                                            earliest_time = time_obj
+                                        if latest_time is None or time_obj > latest_time:
+                                            latest_time = time_obj
+                                    
+                                    # 只显示文件名，不显示完整路径
+                                    keyword_results.append(f"[{prefix}] {line}")
+                            
+                            # 存储文件内容
+                            all_file_contents[file_path] = {
+                                'content': content_lines, 
+                                'prefix': prefix,
+                                'file_name': file_name
+                            }
+                else:
+                    # 通过SSH搜索远程文件
+                    # 初始化SSH连接（如果还没有）
+                    if not hasattr(self, 'log_collector') or not self.log_collector.is_connected():
+                        # 获取SSH连接配置
+                        config = {
+                            'ssh': {
+                                'host': self.host_input.text(),
+                                'port': self.port_input.value(),
+                                'username': self.username_input.text(),
+                                'password': self.password_input.text()
+                            }
+                        }
+                        # 创建连接
+                        self.log_collector = LogCollector(config_file=None)
+                        self.log_collector.config = config
+                        self.log_collector.connect()
+                        self.log_message("已连接到服务器")
+                    
+                    # 检查文件是否为压缩文件
+                    if file_path.endswith('.zip'):
+                        # 下载压缩文件到临时目录
+                        temp_dir = tempfile.mkdtemp()
+                        local_zip = os.path.join(temp_dir, os.path.basename(file_path))
+                        self.log_collector.download_file(file_path, local_zip)
+                        
+                        # 解压并搜索
+                        with zipfile.ZipFile(local_zip, 'r') as zip_ref:
+                            for name in zip_ref.namelist():
+                                # 为zip内每个文件提取前缀
+                                name_prefix = re.match(r'([^_]+)_?', os.path.basename(name))
+                                inner_prefix = name_prefix.group(1) if name_prefix else prefix
+                                
+                                with zip_ref.open(name) as f:
+                                    # 尝试多种编码读取文件内容
+                                    encodings = ['utf-8', 'gbk', 'gb18030', 'latin1']
+                                    content_lines = []
+                                    for encoding in encodings:
+                                        try:
+                                            f.seek(0)  # 重置文件指针
+                                            content_lines = []
+                                            for line in io.TextIOWrapper(f, encoding=encoding):
+                                                line = line.strip()
+                                                content_lines.append(line)
+                                                if keyword in line:
+                                                    # 提取时间并更新最早/最晚时间
+                                                    time_match = re.search(time_pattern, line)
+                                                    if time_match:
+                                                        time_str = time_match.group(1)
+                                                        time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                                                        
+                                                        if earliest_time is None or time_obj < earliest_time:
+                                                            earliest_time = time_obj
+                                                        if latest_time is None or time_obj > latest_time:
+                                                            latest_time = time_obj
+                                                    
+                                                    keyword_results.append(f"[{inner_prefix}] {line}")
+                                            
+                                            # 存储文件内容
+                                            all_file_contents[f"{file_path}/{name}"] = {
+                                                'content': content_lines, 
+                                                'prefix': inner_prefix,
+                                                'file_name': os.path.basename(name)
+                                            }
+                                            # 如果成功读取，跳出循环
+                                            break
+                                        except UnicodeDecodeError:
+                                            # 尝试下一种编码
+                                            continue
+                                        except Exception as e:
+                                            self.log_message(f"读取压缩文件时出错 ({encoding}): {str(e)}")
+                        
+                        # 清理临时文件
+                        shutil.rmtree(temp_dir)
+                    else:
+                        # 获取完整文件内容
+                        # 首先下载文件到本地临时文件
+                        temp_dir = tempfile.mkdtemp()
+                        local_file = os.path.join(temp_dir, os.path.basename(file_path))
+                        try:
+                            self.log_collector.download_file(file_path, local_file)
+                            
+                            # 读取文件内容
+                            encodings = ['utf-8', 'gbk', 'gb18030', 'latin1']
+                            content_lines = []
+                            for encoding in encodings:
+                                try:
+                                    with open(local_file, 'r', encoding=encoding) as f:
+                                        content_lines = [line.strip() for line in f.readlines()]
+                                    break
+                                except UnicodeDecodeError:
+                                    continue
+                            
+                            # 如果所有编码都失败，使用二进制模式读取
+                            if not content_lines:
+                                with open(local_file, 'rb') as f:
+                                    content = f.read().decode('utf-8', errors='ignore')
+                                    content_lines = [line.strip() for line in content.splitlines()]
+                            
+                            # 搜索关键字并保存文件内容
+                            all_file_contents[file_path] = {
+                                'content': content_lines,
+                                'prefix': prefix
+                            }
+                            
+                            # 在内容中搜索关键字
+                            for line in content_lines:
+                                if keyword in line:
+                                    # 提取时间并更新最早/最晚时间
+                                    time_match = re.search(time_pattern, line)
+                                    if time_match:
+                                        time_str = time_match.group(1)
+                                        time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                                        
+                                        if earliest_time is None or time_obj < earliest_time:
+                                            earliest_time = time_obj
+                                        if latest_time is None or time_obj > latest_time:
+                                            latest_time = time_obj
+                                    
+                                    keyword_results.append(f"[{prefix}] {line}")
+                        
+                        except Exception as e:
+                            self.log_message(f"下载或处理远程文件失败: {str(e)}")
+                            # 直接在远程搜索
+                            command = f"grep -F '{keyword}' '{file_path}'"
+                            self.log_message(f"执行搜索命令: {command}")
+                            output = self.log_collector.execute_command(command)
+                            
+                            # 处理命令输出结果
+                            if output:
+                                # 尝试多种编码解码输出
+                                output_lines = None
+                                try:
+                                    output_lines = output.splitlines()
+                                except UnicodeDecodeError:
+                                    # 可能字符编码有问题，尝试不同的编码
+                                    try:
+                                        output_lines = output.decode('gbk').splitlines()
+                                    except UnicodeDecodeError:
+                                        try:
+                                            output_lines = output.decode('utf-8', errors='ignore').splitlines()
+                                        except Exception as e:
+                                            self.log_message(f"解码命令输出出错: {str(e)}")
+                                            output_lines = []
+                                
+                                # 处理每一行结果
+                                for line in output_lines:
+                                    line = line.strip()
+                                    # 提取时间并更新最早/最晚时间
+                                    time_match = re.search(time_pattern, line)
+                                    if time_match:
+                                        time_str = time_match.group(1)
+                                        time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                                        
+                                        if earliest_time is None or time_obj < earliest_time:
+                                            earliest_time = time_obj
+                                        if latest_time is None or time_obj > latest_time:
+                                            latest_time = time_obj
+                                    
+                                    self.log_message(f"处理搜索结果: {line[:100]}")  # 只显示前100个字符以免日志过长
+                                    keyword_results.append(f"[{prefix}] {line}")
+                        finally:
+                            # 清理临时文件
+                            shutil.rmtree(temp_dir)
+            
+            # 检查是否找到了时间范围
+            if earliest_time and latest_time:
+                self.log_message(f"找到时间范围: {earliest_time.strftime('%H:%M:%S.%f')[:-3]} - {latest_time.strftime('%H:%M:%S.%f')[:-3]}")
+                
+                # 如果最早和最晚时间相同，扩展时间范围（前后5分钟）
+                if earliest_time == latest_time:
+                    earliest_time = earliest_time - timedelta(minutes=5)
+                    latest_time = latest_time + timedelta(minutes=5)
+                    self.log_message(f"扩展时间范围: {earliest_time.strftime('%H:%M:%S.%f')[:-3]} - {latest_time.strftime('%H:%M:%S.%f')[:-3]}")
+                
+                # 根据时间范围筛选日志
+                final_results = []
+                for file_path, file_data in all_file_contents.items():
+                    content_lines = file_data['content']
+                    prefix = file_data['prefix']
+                    
+                    for line in content_lines:
+                        time_match = re.search(time_pattern, line)
+                        if time_match:
+                            time_str = time_match.group(1)
+                            try:
+                                time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                                
+                                # 检查是否在时间范围内
+                                if earliest_time <= time_obj <= latest_time:
+                                    # 只显示前缀和日志内容，不显示文件路径
+                                    final_results.append(f"[{prefix}] {line}")
+                            except ValueError:
+                                # 时间解析错误，跳过
+                                continue
+                        elif keyword in line:
+                            # 没有时间信息但包含关键字，也添加
+                            final_results.append(f"[{prefix}] {line}")
+                
+                # 显示搜索结果
+                self.result_text.setPlainText('\n'.join(final_results))
+                self.log_message(f"搜索完成，找到 {len(keyword_results)} 个关键字匹配项，显示了 {len(final_results)} 行时间范围内的日志")
+            else:
+                # 如果没找到时间范围，只显示包含关键字的结果
+                self.result_text.setPlainText('\n'.join(keyword_results))
+                self.log_message(f"搜索完成，找到 {len(keyword_results)} 个匹配项，未找到时间范围")
+        except Exception as e:
+            self.log_message(f"搜索失败: {str(e)}")
+            QMessageBox.critical(self, "错误", f"搜索失败：\n{str(e)}")
+        finally:
+            # 关闭进度对话框
+            progress.setValue(len(selected_files))
+
+    def export_results(self):
+        """导出搜索结果"""
+        # 获取搜索结果
+        results = self.result_text.toPlainText()
+        if not results:
+            QMessageBox.warning(self, "警告", "没有搜索结果可导出")
+            return
+        
+        # 选择保存路径
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "保存搜索结果", os.path.expanduser("~") + "/search_results.txt", "文本文件 (*.txt)"
+        )
+        
+        if not file_path:
+            return
+        
+        # 保存文件
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(results)
+            
+            self.log_message(f"搜索结果已导出到: {file_path}")
+            QMessageBox.information(self, "导出成功", f"搜索结果已导出到:\n{file_path}")
+        except Exception as e:
+            self.log_message(f"导出失败: {str(e)}")
+            QMessageBox.critical(self, "导出失败", f"导出失败：\n{str(e)}")
+    
+    def view_full_log(self):
+        """查看完整日志"""
+        # 获取选中的日志文件
+        selected_rows = self.log_list.selectionModel().selectedRows()
+        if not selected_rows:
+            QMessageBox.warning(self, "警告", "请先选择要查看的日志文件")
+            return
+        
+        # 只处理第一个选中的文件
+        row = selected_rows[0].row()
+        name_item = self.log_list.item(row, 0)
+        file_path = name_item.data(Qt.ItemDataRole.UserRole)
+        
+        if not file_path:
+            QMessageBox.warning(self, "警告", "无法获取文件路径")
+            return
+        
+        # 获取SSH连接配置
         config = {
             'ssh': {
                 'host': self.host_input.text(),
@@ -1946,371 +2458,231 @@ class MainWindow(QMainWindow):
                          for i in range(self.path_list.count())]
         }
         
-        # 禁用按钮
-        self.start_button.setEnabled(False)
-        self.log_message("正在获取文件列表...")
+        # 清空结果显示区
+        self.result_text.clear()
+        self.result_text.setPlainText("正在加载完整日志，请稍候...")
         
-        # 创建工作线程
-        self.worker = LogCollectorWorker(config, mode='list')
-        self.worker.finished.connect(self.collection_finished)
-        self.worker.error.connect(self.collection_error)
-        self.worker.file_list.connect(self.show_file_list)
-        self.worker.start()
-    
-    def show_file_list(self, file_info_list):
-        if not file_info_list:
-            self.log_message("目录为空或无法访问")
-            return
-            
-        self.log_message("\n最新文件列表:")
-        for info in file_info_list:
-            self.log_message(f"目录: {info['path']}")
-            self.log_message(f"文件: {info['name']}")
-            self.log_message(f"日期: {info['date']}")
-            self.log_message("-" * 50)
-        
-        self.start_button.setEnabled(True)
-    
-    def start_collection(self):
-        if not self.host_input.text() or not self.username_input.text():
-            QMessageBox.warning(self, "错误", "请填写主机地址和用户名")
-            return
-        
-        if self.path_list.count() == 0:
-            QMessageBox.warning(self, "错误", "请添加至少一个日志文件路径")
-            return
-        
-        # 检查日期范围
-        start_date, end_date = self.get_date_range()
-        if start_date and end_date and start_date > end_date:
-            QMessageBox.warning(self, "错误", "开始日期不能晚于结束日期")
-            return
-        
-        # 保存当前配置
-        self.save_config()
-        
-        # 准备配置
-        config = {
-            'ssh': {
-                'host': self.host_input.text(),
-                'port': self.port_input.value(),
-                'username': self.username_input.text(),
-                'password': self.password_input.text()
-            },
-            'log_paths': [self.path_list.item(i).text() 
-                         for i in range(self.path_list.count())],
-            'date_range': {
-                'enabled': self.use_date_range.isChecked(),
-                'start_date': start_date.strftime('%Y-%m-%d') if start_date else None,
-                'end_date': end_date.strftime('%Y-%m-%d') if end_date else None
-            }
-        }
-        
-        # 禁用开始按钮
-        self.start_button.setEnabled(False)
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(0)
-        
-        # 创建工作线程
-        self.worker = LogCollectorWorker(config)
-        self.worker.finished.connect(self.collection_finished)
-        self.worker.error.connect(self.collection_error)
-        self.worker.progress.connect(self.update_progress)
-        self.worker.start()
-        
-        self.log_message("开始收集日志文件...")
-    
-    def update_progress(self, filename, current, total):
-        """
-        更新进度条显示
-        """
-        if total <= 0:
-            # 防止除零错误
-            percent = 0
-        else:
-            percent = int(current * 100 / total)
-        
-        self.progress_bar.setValue(percent)
-        self.log_message(f"正在下载: {filename} ({percent}%)")
-    
-    def collection_finished(self, zip_path):
-        self.start_button.setEnabled(True)
-        self.progress_bar.setVisible(False)
-        if zip_path:
-            self.log_message(f"日志收集完成！文件保存在: {zip_path}")
-            QMessageBox.information(self, "完成", f"日志收集完成！\n文件保存在: {zip_path}")
-        else:
-            self.log_message("没有找到符合条件的日志文件")
-            QMessageBox.warning(self, "提示", "在指定的目录中没有找到符合日期条件的日志文件。\n请检查：\n1. 日期范围是否正确\n2. 目录中是否存在对应日期的日志文件")
-    
-    def collection_error(self, error_message):
-        self.start_button.setEnabled(True)
-        self.progress_bar.setVisible(False)
-        self.log_message(f"错误: {error_message}")
-        QMessageBox.critical(self, "错误", f"操作失败：\n{error_message}")
-
-    def get_log_list(self):
-        """获取日志列表"""
-        if not self.host_input.text() or not self.username_input.text():
-            QMessageBox.warning(self, "错误", "请填写主机地址和用户名")
-            return
-        
-        if self.path_list.count() == 0:
-            QMessageBox.warning(self, "错误", "请添加至少一个日志文件路径")
-            return
-        
-        # 检查日期范围
-        start_date, end_date = self.get_date_range_analysis()
-        if start_date and end_date and start_date > end_date:
-            QMessageBox.warning(self, "错误", "开始日期不能晚于结束日期")
-            return
-        
-        # 准备配置
-        config = {
-            'ssh': {
-                'host': self.host_input.text(),
-                'port': self.port_input.value(),
-                'username': self.username_input.text(),
-                'password': self.password_input.text()
-            },
-            'log_paths': [self.path_list.item(i).text() 
-                         for i in range(self.path_list.count())],
-            'date_range': {
-                'enabled': self.use_date_range_analysis.isChecked(),
-                'start_date': start_date.strftime('%Y-%m-%d') if start_date else None,
-                'end_date': end_date.strftime('%Y-%m-%d') if end_date else None
-            }
-        }
-        
-        # 清空日志列表
-        self.log_list_widget.clear()
-        self.result_display.clear()
-        
-        # 显示加载信息
-        self.log_message("正在获取日志列表...")
-        
-        # 创建工作线程
-        self.analysis_worker = LogAnalysisWorker(config, mode='list')
-        self.analysis_worker.log_list.connect(self.display_log_list)
-        self.analysis_worker.error.connect(self.analysis_error)
-        self.analysis_worker.log_message_signal.connect(self.log_message)
-        self.analysis_worker.start()
-    
-    def get_date_range_analysis(self):
-        """获取分析选项卡的日期范围"""
-        if self.use_date_range_analysis.isChecked():
-            start_date = self.start_date_analysis.date().toPyDate()
-            end_date = self.end_date_analysis.date().toPyDate()
-            return start_date, end_date
-        return None, None
-    
-    def display_log_list(self, logs):
-        """显示日志列表"""
-        if not logs:
-            self.log_message("没有找到符合条件的日志文件")
-            return
-        
-        self.log_list_widget.clear()
-        for log in logs:
-            item = QListWidgetItem(f"{log['name']}")
-            item.setData(Qt.ItemDataRole.UserRole, log['path'])  # 存储完整路径
-            self.log_list_widget.addItem(item)
-        
-        self.log_message(f"找到 {len(logs)} 个日志文件")
-    
-    def search_keyword(self):
-        """在选中的日志中搜索关键字"""
-        current_item = self.log_list_widget.currentItem()
-        if not current_item:
-            QMessageBox.warning(self, "错误", "请先选择一个日志文件")
-            return
-        
-        keyword = self.keyword_input.text().strip()
-        if not keyword:
-            QMessageBox.warning(self, "错误", "请输入关键字")
-            return
-        
-        # 获取日志文件路径
-        log_path = current_item.data(Qt.ItemDataRole.UserRole)
-        
-        # 准备配置
-        config = {
-            'ssh': {
-                'host': self.host_input.text(),
-                'port': self.port_input.value(),
-                'username': self.username_input.text(),
-                'password': self.password_input.text()
-            }
-        }
-        
-        # 清空结果显示
-        self.result_display.clear()
-        self.log_message(f"正在 {current_item.text()} 中搜索关键字: {keyword}")
-        
-        # 创建工作线程
-        self.analysis_worker = LogAnalysisWorker(
-            config, mode='search', log_path=log_path, keyword=keyword)
-        self.analysis_worker.search_result.connect(self.display_search_result)
-        self.analysis_worker.error.connect(self.analysis_error)
-        self.analysis_worker.log_message_signal.connect(self.log_message)
-        self.analysis_worker.start()
-    
-    def view_full_log(self):
-        """查看完整日志"""
-        current_item = self.log_list_widget.currentItem()
-        if not current_item:
-            QMessageBox.warning(self, "错误", "请先选择一个日志文件")
-            return
-        
-        # 获取日志文件路径
-        log_path = current_item.data(Qt.ItemDataRole.UserRole)
-        
-        # 准备配置
-        config = {
-            'ssh': {
-                'host': self.host_input.text(),
-                'port': self.port_input.value(),
-                'username': self.username_input.text(),
-                'password': self.password_input.text()
-            }
-        }
-        
-        # 清空结果显示
-        self.result_display.clear()
-        self.log_message(f"正在获取 {current_item.text()} 的完整内容...")
-        
-        # 创建工作线程
-        self.analysis_worker = LogAnalysisWorker(
-            config, mode='get_log', log_path=log_path)
+        # 创建并启动工作线程
+        self.log_message(f"正在获取完整日志: {os.path.basename(file_path)}")
+        self.analysis_worker = LogAnalysisWorker(config, mode='full', log_path=file_path)
         self.analysis_worker.complete_log.connect(self.display_full_log)
         self.analysis_worker.error.connect(self.analysis_error)
         self.analysis_worker.log_message_signal.connect(self.log_message)
         self.analysis_worker.start()
     
-    def display_full_log(self, log_content):
+    def display_full_log(self, content):
         """显示完整日志"""
-        # 直接显示完整日志，不添加前缀标记
-        self.result_display.setPlainText(log_content)
-            
-        lines = log_content.count('\n') + 1
-        self.log_message(f"显示完整日志，共 {lines} 行")
-    
-    def export_results(self):
-        """导出搜索结果"""
-        content = self.result_display.toPlainText()
-        if not content:
-            QMessageBox.warning(self, "错误", "没有可导出的内容")
-            return
-        
-        # 获取保存文件路径
-        current_item = self.log_list_widget.currentItem()
-        default_name = "analysis_result.txt"
-        log_prefix = ""
-        if current_item:
-            file_name = current_item.text()
-            log_prefix = self._get_log_prefix(file_name)
-            if "." in file_name:
-                prefix = file_name.rsplit(".", 1)[0]
-                default_name = f"{prefix}_analysis.txt"
-        
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "导出结果", default_name, "文本文件 (*.txt)")
-        
-        if not file_path:
-            return  # 用户取消了保存
-        
-        try:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-            self.log_message(f"结果已保存到 {file_path}")
-            QMessageBox.information(self, "成功", f"结果已保存到:\n{file_path}")
-        except Exception as e:
-            self.log_message(f"保存结果失败: {str(e)}")
-            QMessageBox.critical(self, "错误", f"保存结果失败:\n{str(e)}")
+        self.result_text.setPlainText(content)
+        self.log_message("完整日志加载完成")
     
     def analysis_error(self, error_message):
-        """处理分析过程中的错误"""
+        """错误处理"""
         self.log_message(f"错误: {error_message}")
-        QMessageBox.critical(self, "错误", f"操作失败：\n{error_message}")
-
-    def _get_log_prefix(self, file_name):
-        """从日志文件名中提取前缀
-        例如：'RsuLogic_2025-03-31.log' 返回 'RsuLogic'
-        """
-        import re
-        # 提取日期前的内容作为前缀
-        match = re.search(r'^(.*?)_\d{4}-\d{2}-\d{2}', file_name)
-        if match:
-            return match.group(1)
-        else:
-            # 如果没有符合格式的日期，则使用文件名前部分作为前缀
-            parts = file_name.split('.')
-            if len(parts) > 1:
-                return parts[0]
-            else:
-                return file_name
-
-    def display_search_result(self, keyword, results):
-        """显示搜索结果"""
-        if not results:
-            self.result_display.setPlainText(f"未找到包含关键字 '{keyword}' 的内容")
+        QMessageBox.critical(self, "错误", error_message)
+    
+    def export_time_range_logs(self):
+        """导出时间范围内的日志"""
+        # 获取选中的日志文件
+        selected_rows = self.log_list.selectionModel().selectedRows()
+        if not selected_rows:
+            QMessageBox.warning(self, "警告", "请先选择要导出的日志文件")
             return
         
-        # 获取日志前缀作为标记
-        log_prefix = ""
-        current_item = self.log_list_widget.currentItem()
-        if current_item:
-            log_prefix = self._get_log_prefix(current_item.text())
+        # 获取选中文件的路径
+        selected_files = []
+        for row in selected_rows:
+            name_item = self.log_list.item(row.row(), 0)
+            file_path = name_item.data(Qt.ItemDataRole.UserRole)
+            if file_path:
+                selected_files.append(file_path)
         
-        # 为每行添加前缀标记，但识别JSON结构并特殊处理
-        marked_results = []
-        i = 0
-        while i < len(results):
-            line = results[i]
+        if not selected_files:
+            QMessageBox.warning(self, "警告", "无法获取文件路径")
+            return
+        
+        # 获取时间范围
+        start_date, end_date = self.get_date_range_analysis()
+        earliest_time = datetime.strptime(start_date, '%Y-%m-%d')
+        latest_time = datetime.strptime(end_date, '%Y-%m-%d')
+        latest_time = latest_time.replace(hour=23, minute=59, second=59)
+        
+        # 选择保存路径
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "保存时间范围日志", os.path.expanduser("~") + f"/logs_{start_date}_to_{end_date}.txt", "文本文件 (*.txt)"
+        )
+        
+        if not file_path:
+            return
+        
+        # 获取SSH连接配置
+        config = {
+            'ssh': {
+                'host': self.host_input.text(),
+                'port': self.port_input.value(),
+                'username': self.username_input.text(),
+                'password': self.password_input.text()
+            }
+        }
+        
+        # 创建进度对话框
+        progress_dialog = QProgressDialog("正在导出时间范围日志...", "取消", 0, len(selected_files), self)
+        progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        progress_dialog.show()
+        
+        # 开始导出
+        try:
+            # 匹配时间戳的正则表达式模式，这里假设日志中的时间格式为yyyy-MM-dd HH:mm:ss
+            time_pattern = r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})'
             
-            # 检查是否是JSON记录的开始（包含大括号）
-            if "{" in line and not line.strip().endswith("}"):
-                # 这是JSON记录的开始行，添加前缀
-                original_indent = ""
-                if line.startswith((' ', '\t')):
-                    indent_len = len(line) - len(line.lstrip())
-                    original_indent = line[:indent_len]
-                    line = line[indent_len:]
+            # 连接到服务器
+            collector = LogCollector(config_file=None)
+            collector.config = config
+            collector.connect()
+            
+            # 创建输出文件
+            with open(file_path, 'w', encoding='utf-8') as output_file:
+                # 写入头部信息
+                output_file.write(f"# 时间范围日志导出\n")
+                output_file.write(f"# 时间范围: {start_date} 到 {end_date}\n")
+                output_file.write(f"# 导出时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
                 
-                # 只给第一行添加前缀
-                marked_results.append(f"[{log_prefix}]{original_indent}{line}")
-                
-                # 找到整个JSON记录
-                j = i + 1
-                in_json = True
-                while j < len(results) and in_json:
-                    next_line = results[j]
+                # 处理每个文件
+                for i, log_path in enumerate(selected_files):
+                    progress_dialog.setValue(i)
+                    if progress_dialog.wasCanceled():
+                        break
                     
-                    # 添加JSON内部行（不添加前缀）
-                    marked_results.append(next_line)
+                    log_name = os.path.basename(log_path)
                     
-                    # 检查是否是JSON结束行
-                    if "}" in next_line:
-                        in_json = False
-                    
-                    j += 1
+                    # 检查是否为zip文件
+                    if log_path.lower().endswith('.zip'):
+                        # 处理压缩文件
+                        self.log_message(f"处理压缩文件: {log_name}")
+                        
+                        # 获取到本地缓存
+                        cache_path = None
+                        try:
+                            import tempfile
+                            import hashlib
+                            
+                            # 创建缓存目录
+                            cache_dir = os.path.join(tempfile.gettempdir(), "log_cache")
+                            os.makedirs(cache_dir, exist_ok=True)
+                            
+                            # 计算文件哈希作为缓存文件名
+                            file_hash = hashlib.md5(log_path.encode()).hexdigest()
+                            file_ext = os.path.splitext(log_path)[1]
+                            cache_path = os.path.join(cache_dir, f"{file_hash}{file_ext}")
+                            
+                            # 如果缓存不存在，下载文件
+                            if not os.path.exists(cache_path):
+                                self.log_message(f"下载文件到本地缓存: {log_name}")
+                                collector.sftp.get(log_path, cache_path)
+                            
+                            # 解压并处理文件
+                            import zipfile
+                            import tempfile
+                            
+                            # 创建临时目录
+                            temp_dir = tempfile.mkdtemp()
+                            
+                            try:
+                                with zipfile.ZipFile(cache_path, 'r') as zip_ref:
+                                    # 解压所有文件
+                                    zip_ref.extractall(temp_dir)
+                                    
+                                    # 处理解压后的每个文件
+                                    for root, dirs, files in os.walk(temp_dir):
+                                        for file in files:
+                                            if file.endswith('.log'):
+                                                file_path = os.path.join(root, file)
+                                                
+                                                # 读取文件内容
+                                                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                                    content = f.read()
+                                                
+                                                # 写入文件标题
+                                                output_file.write(f"\n\n===== {log_name}/{file} =====\n\n")
+                                                
+                                                # 过滤时间范围内的日志
+                                                filtered_lines = []
+                                                for line in content.splitlines():
+                                                    match = re.search(time_pattern, line)
+                                                    if match:
+                                                        try:
+                                                            timestamp_str = match.group(1)
+                                                            timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
+                                                            if earliest_time <= timestamp <= latest_time:
+                                                                filtered_lines.append(line)
+                                                        except:
+                                                            # 如果时间解析失败，保留这一行
+                                                            if filtered_lines:
+                                                                filtered_lines.append(line)
+                                                    else:
+                                                        # 如果没有时间戳，可能是上一条日志的延续
+                                                        if filtered_lines:
+                                                            filtered_lines.append(line)
+                                                
+                                                # 写入过滤后的内容
+                                                output_file.write('\n'.join(filtered_lines))
+                            finally:
+                                # 清理临时目录
+                                import shutil
+                                shutil.rmtree(temp_dir)
+                        except Exception as e:
+                            self.log_message(f"处理压缩文件失败: {str(e)}")
+                            continue
+                    else:
+                        # 处理普通日志文件
+                        self.log_message(f"处理日志文件: {log_name}")
+                        
+                        # 获取文件内容
+                        if collector.is_remote_windows():
+                            cmd = f'type "{log_path}"'
+                        else:
+                            cmd = f'cat "{log_path}"'
+                        
+                        stdin, stdout, stderr = collector.ssh.exec_command(cmd)
+                        try:
+                            content = stdout.read().decode('utf-8', errors='ignore')
+                        except:
+                            content = stdout.read().decode('gbk', errors='ignore')
+                        
+                        # 写入文件标题
+                        output_file.write(f"\n\n===== {log_name} =====\n\n")
+                        
+                        # 过滤时间范围内的日志
+                        filtered_lines = []
+                        for line in content.splitlines():
+                            match = re.search(time_pattern, line)
+                            if match:
+                                try:
+                                    timestamp_str = match.group(1)
+                                    timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
+                                    if earliest_time <= timestamp <= latest_time:
+                                        filtered_lines.append(line)
+                                except:
+                                    # 如果时间解析失败，保留这一行
+                                    if filtered_lines:
+                                        filtered_lines.append(line)
+                            else:
+                                # 如果没有时间戳，可能是上一条日志的延续
+                                if filtered_lines:
+                                    filtered_lines.append(line)
+                        
+                        # 写入过滤后的内容
+                        output_file.write('\n'.join(filtered_lines))
                 
-                # 更新索引
-                i = j
-            else:
-                # 普通行，添加前缀
-                original_indent = ""
-                if line.startswith((' ', '\t')):
-                    indent_len = len(line) - len(line.lstrip())
-                    original_indent = line[:indent_len]
-                    line = line[indent_len:]
-                
-                marked_results.append(f"[{log_prefix}]{original_indent}{line}")
-                i += 1
-        
-        # 显示结果
-        self.result_display.setPlainText("\n".join(marked_results))
-        self.log_message(f"找到 {len(results)} 行包含关键字 '{keyword}'")
+                self.log_message(f"时间范围日志已导出到: {file_path}")
+                QMessageBox.information(self, "导出成功", f"时间范围日志已导出到:\n{file_path}")
+        except Exception as e:
+            self.log_message(f"导出时间范围日志失败: {str(e)}")
+            QMessageBox.critical(self, "导出失败", f"导出失败：\n{str(e)}")
+        finally:
+            # 关闭连接并关闭进度对话框
+            if 'collector' in locals():
+                collector.close()
+            progress_dialog.accept()
 
 def main():
     app = QApplication(sys.argv)
@@ -2319,4 +2691,4 @@ def main():
     sys.exit(app.exec())
 
 if __name__ == "__main__":
-    main() 
+    main()

@@ -3,5 +3,7 @@ build/
 dist/
 *.spec
 __pycache__/
-*.pyc 
-hosts.yaml 
+*.pyc
+hosts.yaml
+log_collector_gui_refactored.py
+log_collector.log
