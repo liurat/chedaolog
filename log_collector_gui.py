@@ -2369,22 +2369,137 @@ class MainWindow(QMainWindow):
                 sorted_results = []
                 result_times = []
                 
-                # 从keyword_results中提取时间和内容
-                for line in keyword_results:
-                    content = line.split('] ', 1)[1] if '] ' in line else line
-                    time_match = re.search(time_pattern, content)
-                    if time_match:
-                        time_str = time_match.group(1)
-                        try:
-                            time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
-                            sorted_results.append((time_obj, line))
-                            result_times.append(time_obj)
-                        except ValueError:
-                            # 时间解析错误，放在结果列表末尾
+                # 增强版处理：检查JSON结构体和多行日志记录
+                enhanced_keyword_results = []
+                
+                # 遍历所有文件内容，提取完整的日志记录
+                for file_path, file_data in all_file_contents.items():
+                    content_lines = file_data['content']
+                    prefix = file_data['prefix']
+                    
+                    # 处理每个文件的内容
+                    i = 0
+                    while i < len(content_lines):
+                        # 检查当前行是否包含关键字或JSON结构体中包含关键字
+                        current_line = content_lines[i]
+                        has_keyword = keyword in current_line
+                        has_json = '{' in current_line and '}' in current_line
+                        
+                        # 检查是否是日志的一部分，通常包含时间戳
+                        is_log_line = re.search(time_pattern, current_line) is not None
+                        
+                        # 如果当前行包含关键字
+                        if has_keyword:
+                            # 确定是否需要查找上下文
+                            if has_json or not is_log_line:
+                                # 向上查找包含时间戳的行，最多查找3行
+                                context_lines = []
+                                for j in range(max(0, i-3), i):
+                                    if re.search(time_pattern, content_lines[j]):
+                                        context_lines = content_lines[j:i+1]
+                                        break
+                                
+                                if context_lines:
+                                    # 合并成一个完整的日志记录
+                                    full_log = '\n'.join(context_lines)
+                                    enhanced_keyword_results.append(f"[{prefix}] {full_log}")
+                                    
+                                    # 提取时间并更新最早/最晚时间
+                                    time_match = re.search(time_pattern, context_lines[0])
+                                    if time_match:
+                                        time_str = time_match.group(1)
+                                        try:
+                                            time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                                            result_times.append(time_obj)
+                                        except ValueError:
+                                            pass
+                                else:
+                                    # 没有找到上下文，使用当前行
+                                    enhanced_keyword_results.append(f"[{prefix}] {current_line}")
+                            else:
+                                # 正常的日志行，直接添加
+                                enhanced_keyword_results.append(f"[{prefix}] {current_line}")
+                                
+                                # 提取时间
+                                time_match = re.search(time_pattern, current_line)
+                                if time_match:
+                                    time_str = time_match.group(1)
+                                    try:
+                                        time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                                        result_times.append(time_obj)
+                                    except ValueError:
+                                        pass
+                        # 如果当前行包含JSON结构体，但不直接包含关键字，检查JSON内部
+                        elif has_json and keyword not in current_line:
+                            # 检查JSON内部是否包含关键字
+                            start_idx = current_line.find('{')
+                            end_idx = current_line.rfind('}') + 1
+                            if start_idx >= 0 and end_idx > start_idx:
+                                json_text = current_line[start_idx:end_idx]
+                                if keyword in json_text:
+                                    # 向上查找包含时间戳的行，最多查找3行
+                                    context_lines = []
+                                    for j in range(max(0, i-3), i+1):
+                                        context_lines.append(content_lines[j])
+                                        if j < i and re.search(time_pattern, content_lines[j]):
+                                            break
+                                    
+                                    # 合并成一个完整的日志记录
+                                    full_log = '\n'.join(context_lines)
+                                    enhanced_keyword_results.append(f"[{prefix}] {full_log}")
+                                    
+                                    # 提取时间并更新最早/最晚时间
+                                    time_match = None
+                                    for line in context_lines:
+                                        time_match = re.search(time_pattern, line)
+                                        if time_match:
+                                            break
+                                    
+                                    if time_match:
+                                        time_str = time_match.group(1)
+                                        try:
+                                            time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                                            result_times.append(time_obj)
+                                        except ValueError:
+                                            pass
+                        
+                        i += 1
+                
+                # 如果增强版结果为空，使用原始结果
+                if not enhanced_keyword_results:
+                    # 从keyword_results中提取时间和内容
+                    for line in keyword_results:
+                        content = line.split('] ', 1)[1] if '] ' in line else line
+                        time_match = re.search(time_pattern, content)
+                        if time_match:
+                            time_str = time_match.group(1)
+                            try:
+                                time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                                sorted_results.append((time_obj, line))
+                                result_times.append(time_obj)
+                            except ValueError:
+                                # 时间解析错误，放在结果列表末尾
+                                sorted_results.append((datetime.max, line))
+                        else:
+                            # 没有时间信息，放在结果列表末尾
                             sorted_results.append((datetime.max, line))
-                    else:
-                        # 没有时间信息，放在结果列表末尾
-                        sorted_results.append((datetime.max, line))
+                else:
+                    # 使用增强版结果
+                    # 为每个结果分配时间，用于排序
+                    for i, line in enumerate(enhanced_keyword_results):
+                        content = line.split('] ', 1)[1] if '] ' in line else line
+                        time_match = re.search(time_pattern, content)
+                        if time_match:
+                            time_str = time_match.group(1)
+                            try:
+                                time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                                sorted_results.append((time_obj, line))
+                            except ValueError:
+                                # 时间解析错误，放在结果列表末尾
+                                sorted_results.append((datetime.max, line))
+                        else:
+                            # 没有时间信息，放在结果列表末尾
+                            sorted_results.append((datetime.max, line))
                 
                 # 按时间排序
                 sorted_results.sort(key=lambda x: x[0])
@@ -2394,7 +2509,7 @@ class MainWindow(QMainWindow):
                 
                 # 显示搜索结果
                 self.result_text.setPlainText('\n'.join(final_results))
-                self.log_message(f"搜索完成，找到 {len(keyword_results)} 个关键字匹配项，按时间排序显示")
+                self.log_message(f"搜索完成，找到 {len(final_results)} 个关键字匹配项，按时间排序显示")
             else:
                 # 如果没找到时间范围，只显示包含关键字的结果
                 self.result_text.setPlainText('\n'.join(keyword_results))
