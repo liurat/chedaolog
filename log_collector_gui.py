@@ -2364,33 +2364,37 @@ class MainWindow(QMainWindow):
                     latest_time = latest_time + timedelta(minutes=5)
                     self.log_message(f"扩展时间范围: {earliest_time.strftime('%H:%M:%S.%f')[:-3]} - {latest_time.strftime('%H:%M:%S.%f')[:-3]}")
                 
-                # 根据时间范围筛选日志
-                final_results = []
-                for file_path, file_data in all_file_contents.items():
-                    content_lines = file_data['content']
-                    prefix = file_data['prefix']
-                    
-                    for line in content_lines:
-                        time_match = re.search(time_pattern, line)
-                        if time_match:
-                            time_str = time_match.group(1)
-                            try:
-                                time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
-                                
-                                # 检查是否在时间范围内
-                                if earliest_time <= time_obj <= latest_time:
-                                    # 只显示前缀和日志内容，不显示文件路径
-                                    final_results.append(f"[{prefix}] {line}")
-                            except ValueError:
-                                # 时间解析错误，跳过
-                                continue
-                        elif keyword in line:
-                            # 没有时间信息但包含关键字，也添加
-                            final_results.append(f"[{prefix}] {line}")
+                # 修改：只显示包含关键字的结果
+                # 排序keyword_results，确保按时间顺序显示
+                sorted_results = []
+                result_times = []
+                
+                # 从keyword_results中提取时间和内容
+                for line in keyword_results:
+                    content = line.split('] ', 1)[1] if '] ' in line else line
+                    time_match = re.search(time_pattern, content)
+                    if time_match:
+                        time_str = time_match.group(1)
+                        try:
+                            time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                            sorted_results.append((time_obj, line))
+                            result_times.append(time_obj)
+                        except ValueError:
+                            # 时间解析错误，放在结果列表末尾
+                            sorted_results.append((datetime.max, line))
+                    else:
+                        # 没有时间信息，放在结果列表末尾
+                        sorted_results.append((datetime.max, line))
+                
+                # 按时间排序
+                sorted_results.sort(key=lambda x: x[0])
+                
+                # 只保留排序后的内容
+                final_results = [item[1] for item in sorted_results]
                 
                 # 显示搜索结果
                 self.result_text.setPlainText('\n'.join(final_results))
-                self.log_message(f"搜索完成，找到 {len(keyword_results)} 个关键字匹配项，显示了 {len(final_results)} 行时间范围内的日志")
+                self.log_message(f"搜索完成，找到 {len(keyword_results)} 个关键字匹配项，按时间排序显示")
             else:
                 # 如果没找到时间范围，只显示包含关键字的结果
                 self.result_text.setPlainText('\n'.join(keyword_results))
