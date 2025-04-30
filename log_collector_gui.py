@@ -92,7 +92,7 @@ class LogCollectorWorker(QThread):
                                                 'date': f"{date_str} {time_str}",
                                                 'path': path
                                             })
-                                        except:
+                                        except Exception:
                                             continue
                             else:
                                 # Linux系统使用ls命令
@@ -2015,9 +2015,9 @@ class MainWindow(QMainWindow):
             self.log_message("开始搜索关键字: " + keyword)
             keyword_results = []  # 包含关键字的结果
             all_file_contents = {}  # 存储每个文件的完整内容
-            time_pattern = r'(\d{2}:\d{2}:\d{2}\.\d{3})'  # 精确匹配时间格式 HH:MM:SS.mmm
-            # 添加JSON中RegTime字段的正则匹配
-            json_time_pattern = r'"RegTime"\s*:\s*"([^"]+)"'
+            # 修改为匹配行首的时间戳格式，支持有无毫秒的情况
+            time_pattern = r'^(\d{2}:\d{2}:\d{2}(?:\.\d{3})?)'
+            # 不再匹配和使用RegTime
             earliest_time = None
             latest_time = None
             
@@ -2054,9 +2054,18 @@ class MainWindow(QMainWindow):
                                                 # 提取时间并更新最早/最晚时间
                                                 time_match = re.search(time_pattern, line)
                                                 if time_match:
+                                                    # 使用常规时间戳
                                                     time_str = time_match.group(1)
-                                                    time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
-                                                    
+                                                    try:
+                                                        # 根据时间格式进行灵活解析
+                                                        if '.' in time_str:
+                                                            # 含有毫秒的时间格式 HH:MM:SS.fff
+                                                            time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                                                        else:
+                                                            # 不含毫秒的时间格式 HH:MM:SS
+                                                            time_obj = datetime.strptime(time_str, '%H:%M:%S')
+                                                    except ValueError as e:
+                                                        print(f"时间解析错误: {str(e)}")
                                                     if earliest_time is None or time_obj < earliest_time:
                                                         earliest_time = time_obj
                                                     if latest_time is None or time_obj > latest_time:
@@ -2082,9 +2091,18 @@ class MainWindow(QMainWindow):
                                                     # 提取时间并更新
                                                     time_match = re.search(time_pattern, line)
                                                     if time_match:
+                                                        # 使用常规时间戳
                                                         time_str = time_match.group(1)
-                                                        time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
-                                                        
+                                                        try:
+                                                            # 根据时间格式进行灵活解析
+                                                            if '.' in time_str:
+                                                                # 含有毫秒的时间格式 HH:MM:SS.fff
+                                                                time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                                                            else:
+                                                                # 不含毫秒的时间格式 HH:MM:SS
+                                                                time_obj = datetime.strptime(time_str, '%H:%M:%S')
+                                                        except ValueError as e:
+                                                            print(f"时间解析错误: {str(e)}")
                                                         if earliest_time is None or time_obj < earliest_time:
                                                             earliest_time = time_obj
                                                         if latest_time is None or time_obj > latest_time:
@@ -2108,9 +2126,18 @@ class MainWindow(QMainWindow):
                                                     # 提取时间并更新
                                                     time_match = re.search(time_pattern, line)
                                                     if time_match:
+                                                        # 使用常规时间戳
                                                         time_str = time_match.group(1)
-                                                        time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
-                                                        
+                                                        try:
+                                                            # 根据时间格式进行灵活解析
+                                                            if '.' in time_str:
+                                                                # 含有毫秒的时间格式 HH:MM:SS.fff
+                                                                time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                                                            else:
+                                                                # 不含毫秒的时间格式 HH:MM:SS
+                                                                time_obj = datetime.strptime(time_str, '%H:%M:%S')
+                                                        except ValueError as e:
+                                                            print(f"时间解析错误: {str(e)}")
                                                         if earliest_time is None or time_obj < earliest_time:
                                                             earliest_time = time_obj
                                                         if latest_time is None or time_obj > latest_time:
@@ -2174,9 +2201,18 @@ class MainWindow(QMainWindow):
                                     # 提取时间并更新最早/最晚时间
                                     time_match = re.search(time_pattern, line)
                                     if time_match:
+                                        # 使用常规时间戳
                                         time_str = time_match.group(1)
-                                        time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
-                                        
+                                        try:
+                                            # 根据时间格式进行灵活解析
+                                            if '.' in time_str:
+                                                # 含有毫秒的时间格式 HH:MM:SS.fff
+                                                time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                                            else:
+                                                # 不含毫秒的时间格式 HH:MM:SS
+                                                time_obj = datetime.strptime(time_str, '%H:%M:%S')
+                                        except ValueError as e:
+                                            print(f"时间解析错误: {str(e)}")
                                         if earliest_time is None or time_obj < earliest_time:
                                             earliest_time = time_obj
                                         if latest_time is None or time_obj > latest_time:
@@ -2239,9 +2275,18 @@ class MainWindow(QMainWindow):
                                                     # 提取时间并更新最早/最晚时间
                                                     time_match = re.search(time_pattern, line)
                                                     if time_match:
+                                                        # 使用常规时间戳
                                                         time_str = time_match.group(1)
-                                                        time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
-                                                        
+                                                        try:
+                                                            # 根据时间格式进行灵活解析
+                                                            if '.' in time_str:
+                                                                # 含有毫秒的时间格式 HH:MM:SS.fff
+                                                                time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                                                            else:
+                                                                # 不含毫秒的时间格式 HH:MM:SS
+                                                                time_obj = datetime.strptime(time_str, '%H:%M:%S')
+                                                        except ValueError as e:
+                                                            print(f"时间解析错误: {str(e)}")
                                                         if earliest_time is None or time_obj < earliest_time:
                                                             earliest_time = time_obj
                                                         if latest_time is None or time_obj > latest_time:
@@ -2302,9 +2347,18 @@ class MainWindow(QMainWindow):
                                     # 提取时间并更新最早/最晚时间
                                     time_match = re.search(time_pattern, line)
                                     if time_match:
+                                        # 使用常规时间戳
                                         time_str = time_match.group(1)
-                                        time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
-                                        
+                                        try:
+                                            # 根据时间格式进行灵活解析
+                                            if '.' in time_str:
+                                                # 含有毫秒的时间格式 HH:MM:SS.fff
+                                                time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                                            else:
+                                                # 不含毫秒的时间格式 HH:MM:SS
+                                                time_obj = datetime.strptime(time_str, '%H:%M:%S')
+                                        except ValueError as e:
+                                            print(f"时间解析错误: {str(e)}")
                                         if earliest_time is None or time_obj < earliest_time:
                                             earliest_time = time_obj
                                         if latest_time is None or time_obj > latest_time:
@@ -2342,9 +2396,18 @@ class MainWindow(QMainWindow):
                                     # 提取时间并更新最早/最晚时间
                                     time_match = re.search(time_pattern, line)
                                     if time_match:
+                                        # 使用常规时间戳
                                         time_str = time_match.group(1)
-                                        time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
-                                        
+                                        try:
+                                            # 根据时间格式进行灵活解析
+                                            if '.' in time_str:
+                                                # 含有毫秒的时间格式 HH:MM:SS.fff
+                                                time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                                            else:
+                                                # 不含毫秒的时间格式 HH:MM:SS
+                                                time_obj = datetime.strptime(time_str, '%H:%M:%S')
+                                        except ValueError as e:
+                                            print(f"时间解析错误: {str(e)}")
                                         if earliest_time is None or time_obj < earliest_time:
                                             earliest_time = time_obj
                                         if latest_time is None or time_obj > latest_time:
@@ -2393,60 +2456,18 @@ class MainWindow(QMainWindow):
                         # 检查是否包含时间戳（可能是日志块开始）
                         time_match = re.search(time_pattern, line)
                         
-                        # 如果没有常规时间戳，检查JSON RegTime字段
-                        if not time_match and '"RegTime"' in line:
-                            json_time_match = re.search(json_time_pattern, line)
-                            if json_time_match:
-                                # 从JSON中提取时间，转换为秒级精度
-                                json_time_str = json_time_match.group(1)
-                                try:
-                                    # 尝试从类似 "2025-04-19 03:20:10.000" 格式中提取时间
-                                    dt_obj = datetime.strptime(json_time_str, '%Y-%m-%d %H:%M:%S.%f')
-                                    # 只保留时间部分用于比较
-                                    time_obj = datetime.strptime(dt_obj.strftime('%H:%M:%S.%f'), '%H:%M:%S.%f')
-                                    
-                                    # 检查是否在时间范围内
-                                    if earliest_time <= time_obj <= latest_time:
-                                        # 确定日志块的结束（与常规时间戳处理类似）
-                                        block_end = i
-                                        for j in range(i+1, min(len(content_lines), i+20)):
-                                            next_line = content_lines[j].strip()
-                                            # 如果发现下一个时间戳或RegTime字段，当前块结束
-                                            if re.search(time_pattern, next_line) is not None or \
-                                               ('"RegTime"' in next_line and re.search(json_time_pattern, next_line)):
-                                                break
-                                            block_end = j
-                                        
-                                        # 获取完整的日志块
-                                        block_lines = content_lines[i:block_end+1]
-                                        
-                                        # 检查此日志块是否已被处理，避免重复
-                                        block_text = '\n'.join(block_lines)
-                                        if block_text not in displayed_lines:
-                                            # 格式化并添加日志块
-                                            formatted_block = [f"[{prefix}] {block_lines[0]}"]
-                                            formatted_block.extend(block_lines[1:])
-                                            
-                                            # 添加到排序结果
-                                            sorted_results.append((time_obj, '\n'.join(formatted_block)))
-                                            
-                                            # 标记为已处理
-                                            displayed_lines.add(block_text)
-                                        
-                                        # 跳过已处理的行
-                                        i = block_end + 1
-                                        continue
-                                except ValueError:
-                                    # 时间解析错误，继续处理
-                                    pass
-                            i += 1
-                            continue
-                            
+                        # 不再单独处理含有RegTime的JSON行
                         if time_match:
                             # 提取时间
                             time_str = time_match.group(1)
                             try:
-                                time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                                # 根据时间格式进行灵活解析
+                                if '.' in time_str:
+                                    # 含有毫秒的时间格式 HH:MM:SS.fff
+                                    time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                                else:
+                                    # 不含毫秒的时间格式 HH:MM:SS
+                                    time_obj = datetime.strptime(time_str, '%H:%M:%S')
                                 
                                 # 检查是否在时间范围内
                                 if earliest_time <= time_obj <= latest_time:
@@ -2454,6 +2475,7 @@ class MainWindow(QMainWindow):
                                     block_end = i
                                     for j in range(i+1, min(len(content_lines), i+20)):
                                         next_line = content_lines[j].strip()
+                                        # 只检查常规时间戳，不将RegTime视为新日志块的开始
                                         if re.search(time_pattern, next_line) is not None:
                                             # 发现下一个时间戳，本块结束
                                             break
@@ -2493,57 +2515,81 @@ class MainWindow(QMainWindow):
                     # 从行中提取内容
                     content = line.split('] ', 1)[1] if '] ' in line else line
                     
-                    # 检查常规时间戳
+                    # 只检查常规时间戳，不处理RegTime
                     time_match = re.search(time_pattern, content)
-                    time_obj = None
-                    
-                    # 如果没有找到常规时间戳，检查JSON RegTime
-                    if not time_match and '"RegTime"' in content:
-                        json_time_match = re.search(json_time_pattern, content)
-                        if json_time_match:
-                            # 从JSON中提取时间
-                            json_time_str = json_time_match.group(1)
-                            try:
-                                # 尝试解析JSON中的时间
-                                dt_obj = datetime.strptime(json_time_str, '%Y-%m-%d %H:%M:%S.%f')
-                                # 只保留时间部分用于比较
-                                time_obj = datetime.strptime(dt_obj.strftime('%H:%M:%S.%f'), '%H:%M:%S.%f')
-                                
-                                # 检查是否在时间范围内，并且确定这是否为日志块的一部分
-                                # 只有当该行不是已知日志块的一部分时才添加
-                                if earliest_time <= time_obj <= latest_time:
-                                    # 检查是否为孤立的JSON行或日志块的一部分
-                                    is_part_of_existing_block = False
-                                    for existing_line in displayed_lines:
-                                        if content in existing_line:
-                                            is_part_of_existing_block = True
-                                            break
-                                    
-                                    if not is_part_of_existing_block:
-                                        sorted_results.append((time_obj, line))
-                                        displayed_lines.add(line)
-                            except ValueError:
-                                # 时间解析错误，继续下一行
-                                continue
-                    elif time_match:
+                    if time_match:
                         # 使用常规时间戳
                         time_str = time_match.group(1)
                         try:
-                            time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                            # 根据时间格式进行灵活解析
+                            if '.' in time_str:
+                                # 含有毫秒的时间格式 HH:MM:SS.fff
+                                time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                            else:
+                                # 不含毫秒的时间格式 HH:MM:SS
+                                time_obj = datetime.strptime(time_str, '%H:%M:%S')
+                            
+                            # 如果成功提取到时间并在范围内，尝试构建日志块
+                            if earliest_time <= time_obj <= latest_time:
+                                # 查找该行在 keyword_results 中的索引
+                                try:
+                                    line_index = keyword_results.index(line)
+                                    
+                                    # 尝试构建日志块，最多查找后面10行
+                                    block_lines = [line]
+                                    for j in range(line_index + 1, min(len(keyword_results), line_index + 10)):
+                                        next_line = keyword_results[j]
+                                        next_content = next_line.split('] ', 1)[1] if '] ' in next_line else next_line
+                                        
+                                        # 只检查常规时间戳，不检查RegTime
+                                        if re.search(time_pattern, next_content) is not None:
+                                            break
+                                            
+                                        # 将行添加到当前块
+                                        block_lines.append(next_line)
+                                    
+                                    # 合并日志块文本
+                                    block_text = '\n'.join(block_lines)
+                                    
+                                    # 检查此日志块是否已处理
+                                    if not any(block_text in existing for existing in displayed_lines):
+                                        sorted_results.append((time_obj, block_text))
+                                        
+                                        # 将块中所有行标记为已处理
+                                        for block_line in block_lines:
+                                            displayed_lines.add(block_line)
+                                except ValueError:
+                                    # 如果无法找到该行的索引，添加单行
+                                    if line not in displayed_lines:
+                                        sorted_results.append((time_obj, line))
+                                        displayed_lines.add(line)
                         except ValueError:
                             # 时间解析错误，继续下一行
                             continue
-                    else:
-                        # 没有任何时间信息，跳过
-                        continue
-                    
-                    # 如果成功提取到时间并在范围内，添加这行
-                    if time_obj and earliest_time <= time_obj <= latest_time:
-                        sorted_results.append((time_obj, line))
-                        displayed_lines.add(line)
                 
                 # 按时间排序
                 sorted_results.sort(key=lambda x: x[0])
+                
+                # 提取排序后结果中的最早和最晚时间
+                if sorted_results:
+                    actual_earliest_time = sorted_results[0][0]
+                    actual_latest_time = sorted_results[-1][0]
+                    self.log_message(f"实际日志块时间范围: {actual_earliest_time.strftime('%H:%M:%S.%f')[:-3]} - {actual_latest_time.strftime('%H:%M:%S.%f')[:-3]}")
+                    
+                    # 计算时间差异
+                    if actual_earliest_time > earliest_time:
+                        time_diff = actual_earliest_time - earliest_time
+                        self.log_message(f"注意: 实际最早时间比设定晚 {time_diff.total_seconds():.3f} 秒")
+                    elif actual_earliest_time < earliest_time:
+                        time_diff = earliest_time - actual_earliest_time
+                        self.log_message(f"注意: 实际最早时间比设定早 {time_diff.total_seconds():.3f} 秒")
+                        
+                    if actual_latest_time < latest_time:
+                        time_diff = latest_time - actual_latest_time
+                        self.log_message(f"注意: 实际最晚时间比设定早 {time_diff.total_seconds():.3f} 秒")
+                    elif actual_latest_time > latest_time:
+                        time_diff = actual_latest_time - latest_time
+                        self.log_message(f"注意: 实际最晚时间比设定晚 {time_diff.total_seconds():.3f} 秒")
                 
                 # 只保留排序后的内容
                 final_results = [item[1] for item in sorted_results]
@@ -2565,33 +2611,49 @@ class MainWindow(QMainWindow):
                     # 提取内容
                     content = line.split('] ', 1)[1] if '] ' in line else line
                     
-                    # 检查是否包含时间戳
+                    # 检查是否包含时间戳，只匹配常规时间戳
                     has_timestamp = re.search(time_pattern, content) is not None
                     
-                    # 检查是否包含JSON RegTime
-                    has_json_time = False
-                    if '"RegTime"' in content:
-                        json_time_match = re.search(json_time_pattern, content)
-                        has_json_time = json_time_match is not None
-                        
-                        # 确保该RegTime行是有效的（不重复）
-                        if has_json_time:
-                            # 检查是否为孤立的JSON行或已有日志块的一部分
-                            is_part_of_existing_block = False
-                            for existing_result in processed_results:
-                                if content in existing_result:
-                                    is_part_of_existing_block = True
-                                    break
+                    # 如果含有时间戳，尝试构建日志块
+                    if has_timestamp:
+                        try:
+                            line_index = keyword_results.index(line)
                             
-                            # 如果是已有块的一部分，则不单独添加
-                            if is_part_of_existing_block:
-                                has_json_time = False
+                            # 尝试构建日志块，最多查找后面10行
+                            block_lines = [line]
+                            for j in range(line_index + 1, min(len(keyword_results), line_index + 10)):
+                                next_line = keyword_results[j]
+                                next_content = next_line.split('] ', 1)[1] if '] ' in next_line else next_line
+                                
+                                # 只检查是否有常规时间戳
+                                if re.search(time_pattern, next_content) is not None:
+                                    break
+                                    
+                                # 将行添加到当前块
+                                block_lines.append(next_line)
+                            
+                            # 合并日志块文本
+                            block_text = '\n'.join(block_lines)
+                            
+                            # 将整个块添加到结果中
+                            processed_results.append(block_text)
+                            
+                            # 标记所有行为已处理
+                            for block_line in block_lines:
+                                displayed_lines.add(block_line)
+                            
+                            # 继续处理下一行
+                            continue
+                        except ValueError:
+                            # 如果构建块失败，回退到单行处理
+                            pass
                     
-                    # 只保留有时间戳的行
-                    if has_timestamp or has_json_time:
+                    # 单行处理：只保留有常规时间戳的行
+                    if has_timestamp:
                         processed_results.append(line)
                         displayed_lines.add(line)
                 
+                # 显示处理结果
                 self.result_text.setPlainText('\n'.join(processed_results))
                 self.log_message(f"搜索完成，找到 {len(processed_results)} 个有效匹配项，未找到时间范围")
         except Exception as e:
