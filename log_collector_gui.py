@@ -2016,6 +2016,8 @@ class MainWindow(QMainWindow):
             keyword_results = []  # 包含关键字的结果
             all_file_contents = {}  # 存储每个文件的完整内容
             time_pattern = r'(\d{2}:\d{2}:\d{2}\.\d{3})'  # 精确匹配时间格式 HH:MM:SS.mmm
+            # 添加JSON中RegTime字段的正则匹配
+            json_time_pattern = r'"RegTime"\s*:\s*"([^"]+)"'
             earliest_time = None
             latest_time = None
             
@@ -2364,142 +2366,181 @@ class MainWindow(QMainWindow):
                     latest_time = latest_time + timedelta(minutes=5)
                     self.log_message(f"扩展时间范围: {earliest_time.strftime('%H:%M:%S.%f')[:-3]} - {latest_time.strftime('%H:%M:%S.%f')[:-3]}")
                 
-                # 修改：只显示包含关键字的结果
-                # 排序keyword_results，确保按时间顺序显示
+                # 整理所有结果，确保正确添加前缀
                 sorted_results = []
-                result_times = []
+                displayed_lines = set()  # 用于跟踪已经添加的行，避免重复
                 
-                # 增强版处理：检查JSON结构体和多行日志记录
-                enhanced_keyword_results = []
+                # 优化时间范围处理：确保开始时间正确设置
+                if earliest_time == latest_time:
+                    # 如果开始时间和结束时间相同，向前扩展一分钟
+                    earliest_time = earliest_time - timedelta(minutes=1)
                 
-                # 遍历所有文件内容，提取完整的日志记录
+                self.log_message(f"时间范围: {earliest_time.strftime('%H:%M:%S.%f')} - {latest_time.strftime('%H:%M:%S.%f')}")
+                
+                # 第二阶段：在确定的时间范围内，提取所有日志行并显示
+                self.log_message(f"提取时间范围内的所有日志行")
+                
+                # 遍历所有文件，提取在时间范围内的所有日志
                 for file_path, file_data in all_file_contents.items():
                     content_lines = file_data['content']
                     prefix = file_data['prefix']
                     
-                    # 处理每个文件的内容
+                    # 识别所有时间戳行
                     i = 0
                     while i < len(content_lines):
-                        # 检查当前行是否包含关键字或JSON结构体中包含关键字
-                        current_line = content_lines[i]
-                        has_keyword = keyword in current_line
-                        has_json = '{' in current_line and '}' in current_line
+                        line = content_lines[i].strip()
                         
-                        # 检查是否是日志的一部分，通常包含时间戳
-                        is_log_line = re.search(time_pattern, current_line) is not None
+                        # 检查是否包含时间戳（可能是日志块开始）
+                        time_match = re.search(time_pattern, line)
                         
-                        # 如果当前行包含关键字
-                        if has_keyword:
-                            # 确定是否需要查找上下文
-                            if has_json or not is_log_line:
-                                # 向上查找包含时间戳的行，最多查找3行
-                                context_lines = []
-                                for j in range(max(0, i-3), i):
-                                    if re.search(time_pattern, content_lines[j]):
-                                        context_lines = content_lines[j:i+1]
-                                        break
+                        # 如果没有常规时间戳，检查JSON RegTime字段
+                        if not time_match and '"RegTime"' in line:
+                            json_time_match = re.search(json_time_pattern, line)
+                            if json_time_match:
+                                # 从JSON中提取时间，转换为秒级精度
+                                json_time_str = json_time_match.group(1)
+                                try:
+                                    # 尝试从类似 "2025-04-19 03:20:10.000" 格式中提取时间
+                                    dt_obj = datetime.strptime(json_time_str, '%Y-%m-%d %H:%M:%S.%f')
+                                    # 只保留时间部分用于比较
+                                    time_obj = datetime.strptime(dt_obj.strftime('%H:%M:%S.%f'), '%H:%M:%S.%f')
+                                    
+                                    # 检查是否在时间范围内
+                                    if earliest_time <= time_obj <= latest_time:
+                                        # 确定日志块的结束（与常规时间戳处理类似）
+                                        block_end = i
+                                        for j in range(i+1, min(len(content_lines), i+20)):
+                                            next_line = content_lines[j].strip()
+                                            # 如果发现下一个时间戳或RegTime字段，当前块结束
+                                            if re.search(time_pattern, next_line) is not None or \
+                                               ('"RegTime"' in next_line and re.search(json_time_pattern, next_line)):
+                                                break
+                                            block_end = j
+                                        
+                                        # 获取完整的日志块
+                                        block_lines = content_lines[i:block_end+1]
+                                        
+                                        # 检查此日志块是否已被处理，避免重复
+                                        block_text = '\n'.join(block_lines)
+                                        if block_text not in displayed_lines:
+                                            # 格式化并添加日志块
+                                            formatted_block = [f"[{prefix}] {block_lines[0]}"]
+                                            formatted_block.extend(block_lines[1:])
+                                            
+                                            # 添加到排序结果
+                                            sorted_results.append((time_obj, '\n'.join(formatted_block)))
+                                            
+                                            # 标记为已处理
+                                            displayed_lines.add(block_text)
+                                        
+                                        # 跳过已处理的行
+                                        i = block_end + 1
+                                        continue
+                                except ValueError:
+                                    # 时间解析错误，继续处理
+                                    pass
+                            i += 1
+                            continue
+                            
+                        if time_match:
+                            # 提取时间
+                            time_str = time_match.group(1)
+                            try:
+                                time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
                                 
-                                if context_lines:
-                                    # 合并成一个完整的日志记录
-                                    full_log = '\n'.join(context_lines)
-                                    enhanced_keyword_results.append(f"[{prefix}] {full_log}")
-                                    
-                                    # 提取时间并更新最早/最晚时间
-                                    time_match = re.search(time_pattern, context_lines[0])
-                                    if time_match:
-                                        time_str = time_match.group(1)
-                                        try:
-                                            time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
-                                            result_times.append(time_obj)
-                                        except ValueError:
-                                            pass
-                                else:
-                                    # 没有找到上下文，使用当前行
-                                    enhanced_keyword_results.append(f"[{prefix}] {current_line}")
-                            else:
-                                # 正常的日志行，直接添加
-                                enhanced_keyword_results.append(f"[{prefix}] {current_line}")
-                                
-                                # 提取时间
-                                time_match = re.search(time_pattern, current_line)
-                                if time_match:
-                                    time_str = time_match.group(1)
-                                    try:
-                                        time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
-                                        result_times.append(time_obj)
-                                    except ValueError:
-                                        pass
-                        # 如果当前行包含JSON结构体，但不直接包含关键字，检查JSON内部
-                        elif has_json and keyword not in current_line:
-                            # 检查JSON内部是否包含关键字
-                            start_idx = current_line.find('{')
-                            end_idx = current_line.rfind('}') + 1
-                            if start_idx >= 0 and end_idx > start_idx:
-                                json_text = current_line[start_idx:end_idx]
-                                if keyword in json_text:
-                                    # 向上查找包含时间戳的行，最多查找3行
-                                    context_lines = []
-                                    for j in range(max(0, i-3), i+1):
-                                        context_lines.append(content_lines[j])
-                                        if j < i and re.search(time_pattern, content_lines[j]):
+                                # 检查是否在时间范围内
+                                if earliest_time <= time_obj <= latest_time:
+                                    # 确定日志块的结束
+                                    block_end = i
+                                    for j in range(i+1, min(len(content_lines), i+20)):
+                                        next_line = content_lines[j].strip()
+                                        if re.search(time_pattern, next_line) is not None:
+                                            # 发现下一个时间戳，本块结束
                                             break
+                                        block_end = j
                                     
-                                    # 合并成一个完整的日志记录
-                                    full_log = '\n'.join(context_lines)
-                                    enhanced_keyword_results.append(f"[{prefix}] {full_log}")
+                                    # 获取完整的日志块
+                                    block_lines = content_lines[i:block_end+1]
                                     
-                                    # 提取时间并更新最早/最晚时间
-                                    time_match = None
-                                    for line in context_lines:
-                                        time_match = re.search(time_pattern, line)
-                                        if time_match:
-                                            break
+                                    # 检查此日志块是否已被处理，避免重复
+                                    block_text = '\n'.join(block_lines)
+                                    if block_text not in displayed_lines:
+                                        # 格式化并添加日志块
+                                        # 只为第一行（时间行）添加前缀
+                                        formatted_block = [f"[{prefix}] {block_lines[0]}"]
+                                        formatted_block.extend(block_lines[1:])
+                                        
+                                        # 添加到排序结果
+                                        sorted_results.append((time_obj, '\n'.join(formatted_block)))
+                                        
+                                        # 标记为已处理
+                                        displayed_lines.add(block_text)
                                     
-                                    if time_match:
-                                        time_str = time_match.group(1)
-                                        try:
-                                            time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
-                                            result_times.append(time_obj)
-                                        except ValueError:
-                                            pass
-                        
+                                    # 跳过已处理的行
+                                    i = block_end + 1
+                                    continue
+                            except ValueError:
+                                # 时间解析错误，继续处理
+                                pass
                         i += 1
                 
-                # 如果增强版结果为空，使用原始结果
-                if not enhanced_keyword_results:
-                    # 从keyword_results中提取时间和内容
-                    for line in keyword_results:
-                        content = line.split('] ', 1)[1] if '] ' in line else line
-                        time_match = re.search(time_pattern, content)
-                        if time_match:
-                            time_str = time_match.group(1)
+                # 如果关键字匹配的结果中有一些不在文件内容中（例如直接grep输出），也需要处理
+                for line in keyword_results:
+                    # 检查是否已经处理过这行
+                    if line in displayed_lines:
+                        continue
+                    
+                    # 从行中提取内容
+                    content = line.split('] ', 1)[1] if '] ' in line else line
+                    
+                    # 检查常规时间戳
+                    time_match = re.search(time_pattern, content)
+                    time_obj = None
+                    
+                    # 如果没有找到常规时间戳，检查JSON RegTime
+                    if not time_match and '"RegTime"' in content:
+                        json_time_match = re.search(json_time_pattern, content)
+                        if json_time_match:
+                            # 从JSON中提取时间
+                            json_time_str = json_time_match.group(1)
                             try:
-                                time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
-                                sorted_results.append((time_obj, line))
-                                result_times.append(time_obj)
+                                # 尝试解析JSON中的时间
+                                dt_obj = datetime.strptime(json_time_str, '%Y-%m-%d %H:%M:%S.%f')
+                                # 只保留时间部分用于比较
+                                time_obj = datetime.strptime(dt_obj.strftime('%H:%M:%S.%f'), '%H:%M:%S.%f')
+                                
+                                # 检查是否在时间范围内，并且确定这是否为日志块的一部分
+                                # 只有当该行不是已知日志块的一部分时才添加
+                                if earliest_time <= time_obj <= latest_time:
+                                    # 检查是否为孤立的JSON行或日志块的一部分
+                                    is_part_of_existing_block = False
+                                    for existing_line in displayed_lines:
+                                        if content in existing_line:
+                                            is_part_of_existing_block = True
+                                            break
+                                    
+                                    if not is_part_of_existing_block:
+                                        sorted_results.append((time_obj, line))
+                                        displayed_lines.add(line)
                             except ValueError:
-                                # 时间解析错误，放在结果列表末尾
-                                sorted_results.append((datetime.max, line))
-                        else:
-                            # 没有时间信息，放在结果列表末尾
-                            sorted_results.append((datetime.max, line))
-                else:
-                    # 使用增强版结果
-                    # 为每个结果分配时间，用于排序
-                    for i, line in enumerate(enhanced_keyword_results):
-                        content = line.split('] ', 1)[1] if '] ' in line else line
-                        time_match = re.search(time_pattern, content)
-                        if time_match:
-                            time_str = time_match.group(1)
-                            try:
-                                time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
-                                sorted_results.append((time_obj, line))
-                            except ValueError:
-                                # 时间解析错误，放在结果列表末尾
-                                sorted_results.append((datetime.max, line))
-                        else:
-                            # 没有时间信息，放在结果列表末尾
-                            sorted_results.append((datetime.max, line))
+                                # 时间解析错误，继续下一行
+                                continue
+                    elif time_match:
+                        # 使用常规时间戳
+                        time_str = time_match.group(1)
+                        try:
+                            time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
+                        except ValueError:
+                            # 时间解析错误，继续下一行
+                            continue
+                    else:
+                        # 没有任何时间信息，跳过
+                        continue
+                    
+                    # 如果成功提取到时间并在范围内，添加这行
+                    if time_obj and earliest_time <= time_obj <= latest_time:
+                        sorted_results.append((time_obj, line))
+                        displayed_lines.add(line)
                 
                 # 按时间排序
                 sorted_results.sort(key=lambda x: x[0])
@@ -2509,11 +2550,50 @@ class MainWindow(QMainWindow):
                 
                 # 显示搜索结果
                 self.result_text.setPlainText('\n'.join(final_results))
-                self.log_message(f"搜索完成，找到 {len(final_results)} 个关键字匹配项，按时间排序显示")
+                self.log_message(f"搜索完成，找到 {len(final_results)} 个时间范围内的日志块")
             else:
-                # 如果没找到时间范围，只显示包含关键字的结果
-                self.result_text.setPlainText('\n'.join(keyword_results))
-                self.log_message(f"搜索完成，找到 {len(keyword_results)} 个匹配项，未找到时间范围")
+                # 如果没找到时间范围，处理原始搜索结果
+                processed_results = []
+                displayed_lines = set()  # 用于跟踪已经添加的行，避免重复
+                
+                # 对keyword_results中的每个结果进行分析和格式化
+                for line in keyword_results:
+                    # 检查是否已经处理过这行
+                    if line in displayed_lines:
+                        continue
+                    
+                    # 提取内容
+                    content = line.split('] ', 1)[1] if '] ' in line else line
+                    
+                    # 检查是否包含时间戳
+                    has_timestamp = re.search(time_pattern, content) is not None
+                    
+                    # 检查是否包含JSON RegTime
+                    has_json_time = False
+                    if '"RegTime"' in content:
+                        json_time_match = re.search(json_time_pattern, content)
+                        has_json_time = json_time_match is not None
+                        
+                        # 确保该RegTime行是有效的（不重复）
+                        if has_json_time:
+                            # 检查是否为孤立的JSON行或已有日志块的一部分
+                            is_part_of_existing_block = False
+                            for existing_result in processed_results:
+                                if content in existing_result:
+                                    is_part_of_existing_block = True
+                                    break
+                            
+                            # 如果是已有块的一部分，则不单独添加
+                            if is_part_of_existing_block:
+                                has_json_time = False
+                    
+                    # 只保留有时间戳的行
+                    if has_timestamp or has_json_time:
+                        processed_results.append(line)
+                        displayed_lines.add(line)
+                
+                self.result_text.setPlainText('\n'.join(processed_results))
+                self.log_message(f"搜索完成，找到 {len(processed_results)} 个有效匹配项，未找到时间范围")
         except Exception as e:
             self.log_message(f"搜索失败: {str(e)}")
             QMessageBox.critical(self, "错误", f"搜索失败：\n{str(e)}")
@@ -2811,3 +2891,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+ 
