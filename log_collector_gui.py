@@ -21,6 +21,7 @@ import io
 import zipfile
 import tempfile
 import shutil
+import hashlib
 
 class LogCollectorWorker(QThread):
     progress = pyqtSignal(str, int, int)  # 文件名，当前进度，总大小
@@ -2431,7 +2432,7 @@ class MainWindow(QMainWindow):
                 
                 # 整理所有结果，确保正确添加前缀
                 sorted_results = []
-                displayed_lines = set()  # 用于跟踪已经添加的行，避免重复
+                displayed_blocks = set()  # 用于跟踪已经添加的日志块，避免重复
                 
                 # 优化时间范围处理：确保开始时间正确设置
                 if earliest_time == latest_time:
@@ -2447,6 +2448,7 @@ class MainWindow(QMainWindow):
                 for file_path, file_data in all_file_contents.items():
                     content_lines = file_data['content']
                     prefix = file_data['prefix']
+                    file_name = file_data.get('file_name', os.path.basename(file_path))
                     
                     # 识别所有时间戳行
                     i = 0
@@ -2456,17 +2458,14 @@ class MainWindow(QMainWindow):
                         # 检查是否包含时间戳（可能是日志块开始）
                         time_match = re.search(time_pattern, line)
                         
-                        # 不再单独处理含有RegTime的JSON行
                         if time_match:
-                            # 提取时间
-                            time_str = time_match.group(1)
                             try:
+                                # 提取时间
+                                time_str = time_match.group(1)
                                 # 根据时间格式进行灵活解析
                                 if '.' in time_str:
-                                    # 含有毫秒的时间格式 HH:MM:SS.fff
                                     time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
                                 else:
-                                    # 不含毫秒的时间格式 HH:MM:SS
                                     time_obj = datetime.strptime(time_str, '%H:%M:%S')
                                 
                                 # 检查是否在时间范围内
@@ -2475,98 +2474,32 @@ class MainWindow(QMainWindow):
                                     block_end = i
                                     for j in range(i+1, min(len(content_lines), i+20)):
                                         next_line = content_lines[j].strip()
-                                        # 只检查常规时间戳，不将RegTime视为新日志块的开始
                                         if re.search(time_pattern, next_line) is not None:
-                                            # 发现下一个时间戳，本块结束
                                             break
                                         block_end = j
                                     
                                     # 获取完整的日志块
                                     block_lines = content_lines[i:block_end+1]
                                     
-                                    # 检查此日志块是否已被处理，避免重复
-                                    block_text = '\n'.join(block_lines)
-                                    if block_text not in displayed_lines:
-                                        # 格式化并添加日志块
-                                        # 只为第一行（时间行）添加前缀
-                                        formatted_block = [f"[{prefix}] {block_lines[0]}"]
-                                        formatted_block.extend(block_lines[1:])
-                                        
-                                        # 添加到排序结果
-                                        sorted_results.append((time_obj, '\n'.join(formatted_block)))
-                                        
-                                        # 标记为已处理
-                                        displayed_lines.add(block_text)
+                                    # 只为第一行添加前缀，其他行保持原样
+                                    prefixed_block_lines = [f"[{prefix}] {block_lines[0]}"]
+                                    if len(block_lines) > 1:
+                                        prefixed_block_lines.extend(block_lines[1:])
                                     
-                                    # 跳过已处理的行
-                                    i = block_end + 1
-                                    continue
-                            except ValueError:
-                                # 时间解析错误，继续处理
+                                    # 生成日志块的唯一标识（使用更严格的标识方式）
+                                    block_text = '\n'.join(prefixed_block_lines)
+                                    block_id = f"{file_name}_{time_str}_{hash(block_text)}"
+                                    
+                                    # 检查此日志块是否已被处理
+                                    if block_id not in displayed_blocks:
+                                        sorted_results.append((time_obj, block_text))
+                                        displayed_blocks.add(block_id)
+                            except ValueError as e:
+                                self.log_message(f"时间解析错误: {str(e)}")
                                 pass
                         i += 1
                 
-                # 如果关键字匹配的结果中有一些不在文件内容中（例如直接grep输出），也需要处理
-                for line in keyword_results:
-                    # 检查是否已经处理过这行
-                    if line in displayed_lines:
-                        continue
-                    
-                    # 从行中提取内容
-                    content = line.split('] ', 1)[1] if '] ' in line else line
-                    
-                    # 只检查常规时间戳，不处理RegTime
-                    time_match = re.search(time_pattern, content)
-                    if time_match:
-                        # 使用常规时间戳
-                        time_str = time_match.group(1)
-                        try:
-                            # 根据时间格式进行灵活解析
-                            if '.' in time_str:
-                                # 含有毫秒的时间格式 HH:MM:SS.fff
-                                time_obj = datetime.strptime(time_str, '%H:%M:%S.%f')
-                            else:
-                                # 不含毫秒的时间格式 HH:MM:SS
-                                time_obj = datetime.strptime(time_str, '%H:%M:%S')
-                            
-                            # 如果成功提取到时间并在范围内，尝试构建日志块
-                            if earliest_time <= time_obj <= latest_time:
-                                # 查找该行在 keyword_results 中的索引
-                                try:
-                                    line_index = keyword_results.index(line)
-                                    
-                                    # 尝试构建日志块，最多查找后面10行
-                                    block_lines = [line]
-                                    for j in range(line_index + 1, min(len(keyword_results), line_index + 10)):
-                                        next_line = keyword_results[j]
-                                        next_content = next_line.split('] ', 1)[1] if '] ' in next_line else next_line
-                                        
-                                        # 只检查常规时间戳，不检查RegTime
-                                        if re.search(time_pattern, next_content) is not None:
-                                            break
-                                            
-                                        # 将行添加到当前块
-                                        block_lines.append(next_line)
-                                    
-                                    # 合并日志块文本
-                                    block_text = '\n'.join(block_lines)
-                                    
-                                    # 检查此日志块是否已处理
-                                    if not any(block_text in existing for existing in displayed_lines):
-                                        sorted_results.append((time_obj, block_text))
-                                        
-                                        # 将块中所有行标记为已处理
-                                        for block_line in block_lines:
-                                            displayed_lines.add(block_line)
-                                except ValueError:
-                                    # 如果无法找到该行的索引，添加单行
-                                    if line not in displayed_lines:
-                                        sorted_results.append((time_obj, line))
-                                        displayed_lines.add(line)
-                        except ValueError:
-                            # 时间解析错误，继续下一行
-                            continue
-                
+                # 移除关键词匹配结果的单独处理
                 # 按时间排序
                 sorted_results.sort(key=lambda x: x[0])
                 
@@ -2597,360 +2530,175 @@ class MainWindow(QMainWindow):
                 # 显示搜索结果
                 self.result_text.setPlainText('\n'.join(final_results))
                 self.log_message(f"搜索完成，找到 {len(final_results)} 个时间范围内的日志块")
-            else:
-                # 如果没找到时间范围，处理原始搜索结果
-                processed_results = []
-                displayed_lines = set()  # 用于跟踪已经添加的行，避免重复
                 
-                # 对keyword_results中的每个结果进行分析和格式化
-                for line in keyword_results:
-                    # 检查是否已经处理过这行
-                    if line in displayed_lines:
-                        continue
-                    
-                    # 提取内容
-                    content = line.split('] ', 1)[1] if '] ' in line else line
-                    
-                    # 检查是否包含时间戳，只匹配常规时间戳
-                    has_timestamp = re.search(time_pattern, content) is not None
-                    
-                    # 如果含有时间戳，尝试构建日志块
-                    if has_timestamp:
-                        try:
-                            line_index = keyword_results.index(line)
-                            
-                            # 尝试构建日志块，最多查找后面10行
-                            block_lines = [line]
-                            for j in range(line_index + 1, min(len(keyword_results), line_index + 10)):
-                                next_line = keyword_results[j]
-                                next_content = next_line.split('] ', 1)[1] if '] ' in next_line else next_line
-                                
-                                # 只检查是否有常规时间戳
-                                if re.search(time_pattern, next_content) is not None:
-                                    break
-                                    
-                                # 将行添加到当前块
-                                block_lines.append(next_line)
-                            
-                            # 合并日志块文本
-                            block_text = '\n'.join(block_lines)
-                            
-                            # 将整个块添加到结果中
-                            processed_results.append(block_text)
-                            
-                            # 标记所有行为已处理
-                            for block_line in block_lines:
-                                displayed_lines.add(block_line)
-                            
-                            # 继续处理下一行
-                            continue
-                        except ValueError:
-                            # 如果构建块失败，回退到单行处理
-                            pass
-                    
-                    # 单行处理：只保留有常规时间戳的行
-                    if has_timestamp:
-                        processed_results.append(line)
-                        displayed_lines.add(line)
-                
-                # 显示处理结果
-                self.result_text.setPlainText('\n'.join(processed_results))
-                self.log_message(f"搜索完成，找到 {len(processed_results)} 个有效匹配项，未找到时间范围")
+                # 关闭进度对话框
+                progress.close()
         except Exception as e:
-            self.log_message(f"搜索失败: {str(e)}")
-            QMessageBox.critical(self, "错误", f"搜索失败：\n{str(e)}")
-        finally:
-            # 关闭进度对话框
-            progress.setValue(len(selected_files))
-
-    def export_results(self):
-        """导出搜索结果"""
-        # 获取搜索结果
-        results = self.result_text.toPlainText()
-        if not results:
-            QMessageBox.warning(self, "警告", "没有搜索结果可导出")
-            return
-        
-        # 选择保存路径
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "保存搜索结果", os.path.expanduser("~") + "/search_results.txt", "文本文件 (*.txt)"
-        )
-        
-        if not file_path:
-            return
-        
-        # 保存文件
-        try:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(results)
-            
-            self.log_message(f"搜索结果已导出到: {file_path}")
-            QMessageBox.information(self, "导出成功", f"搜索结果已导出到:\n{file_path}")
-        except Exception as e:
-            self.log_message(f"导出失败: {str(e)}")
-            QMessageBox.critical(self, "导出失败", f"导出失败：\n{str(e)}")
-    
-    def view_full_log(self):
-        """查看完整日志"""
-        # 获取选中的日志文件
-        selected_rows = self.log_list.selectionModel().selectedRows()
-        if not selected_rows:
-            QMessageBox.warning(self, "警告", "请先选择要查看的日志文件")
-            return
-        
-        # 只处理第一个选中的文件
-        row = selected_rows[0].row()
-        name_item = self.log_list.item(row, 0)
-        file_path = name_item.data(Qt.ItemDataRole.UserRole)
-        
-        if not file_path:
-            QMessageBox.warning(self, "警告", "无法获取文件路径")
-            return
-        
-        # 获取SSH连接配置
-        config = {
-            'ssh': {
-                'host': self.host_input.text(),
-                'port': self.port_input.value(),
-                'username': self.username_input.text(),
-                'password': self.password_input.text()
-            },
-            'log_paths': [self.path_list.item(i).text() 
-                         for i in range(self.path_list.count())]
-        }
-        
-        # 清空结果显示区
-        self.result_text.clear()
-        self.result_text.setPlainText("正在加载完整日志，请稍候...")
-        
-        # 创建并启动工作线程
-        self.log_message(f"正在获取完整日志: {os.path.basename(file_path)}")
-        self.analysis_worker = LogAnalysisWorker(config, mode='full', log_path=file_path)
-        self.analysis_worker.complete_log.connect(self.display_full_log)
-        self.analysis_worker.error.connect(self.analysis_error)
-        self.analysis_worker.log_message_signal.connect(self.log_message)
-        self.analysis_worker.start()
-    
-    def display_full_log(self, content):
-        """显示完整日志"""
-        self.result_text.setPlainText(content)
-        self.log_message("完整日志加载完成")
+            self.error.emit(f"搜索关键字时出错: {str(e)}")
+            # 确保在发生错误时也关闭进度对话框
+            progress.close()
     
     def analysis_error(self, error_message):
         """错误处理"""
         self.log_message(f"错误: {error_message}")
         QMessageBox.critical(self, "错误", error_message)
     
-    def export_time_range_logs(self):
-        """导出时间范围内的日志"""
+    def view_full_log(self):
+        """查看完整日志"""
         # 获取选中的日志文件
         selected_rows = self.log_list.selectionModel().selectedRows()
         if not selected_rows:
-            QMessageBox.warning(self, "警告", "请先选择要导出的日志文件")
+            QMessageBox.warning(self, "警告", "请先选择要查看完整日志的日志文件")
             return
         
-        # 获取选中文件的路径
+        # 获取选中文件的路径和文件名
         selected_files = []
         for row in selected_rows:
-            name_item = self.log_list.item(row.row(), 0)
-            file_path = name_item.data(Qt.ItemDataRole.UserRole)
+            file_path = self.log_list.item(row.row(), 0).data(Qt.ItemDataRole.UserRole)
             if file_path:
                 selected_files.append(file_path)
         
         if not selected_files:
-            QMessageBox.warning(self, "警告", "无法获取文件路径")
+            QMessageBox.warning(self, "警告", "没有选中任何日志文件")
             return
-        
-        # 获取时间范围
-        start_date, end_date = self.get_date_range_analysis()
-        earliest_time = datetime.strptime(start_date, '%Y-%m-%d')
-        latest_time = datetime.strptime(end_date, '%Y-%m-%d')
-        latest_time = latest_time.replace(hour=23, minute=59, second=59)
-        
-        # 选择保存路径
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "保存时间范围日志", os.path.expanduser("~") + f"/logs_{start_date}_to_{end_date}.txt", "文本文件 (*.txt)"
-        )
-        
-        if not file_path:
-            return
-        
-        # 获取SSH连接配置
-        config = {
-            'ssh': {
-                'host': self.host_input.text(),
-                'port': self.port_input.value(),
-                'username': self.username_input.text(),
-                'password': self.password_input.text()
-            }
-        }
         
         # 创建进度对话框
-        progress_dialog = QProgressDialog("正在导出时间范围日志...", "取消", 0, len(selected_files), self)
-        progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
-        progress_dialog.show()
+        progress = QProgressDialog("正在获取完整日志...", "取消", 0, len(selected_files), self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
         
-        # 开始导出
+        # 开始获取完整日志
         try:
-            # 匹配时间戳的正则表达式模式，这里假设日志中的时间格式为yyyy-MM-dd HH:mm:ss
-            time_pattern = r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})'
-            
-            # 连接到服务器
-            collector = LogCollector(config_file=None)
-            collector.config = config
-            collector.connect()
-            
-            # 创建输出文件
-            with open(file_path, 'w', encoding='utf-8') as output_file:
-                # 写入头部信息
-                output_file.write(f"# 时间范围日志导出\n")
-                output_file.write(f"# 时间范围: {start_date} 到 {end_date}\n")
-                output_file.write(f"# 导出时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            for i, file_path in enumerate(selected_files):
+                # 更新进度
+                progress.setValue(i)
+                if progress.wasCanceled():
+                    break
                 
-                # 处理每个文件
-                for i, log_path in enumerate(selected_files):
-                    progress_dialog.setValue(i)
-                    if progress_dialog.wasCanceled():
-                        break
-                    
-                    log_name = os.path.basename(log_path)
-                    
-                    # 检查是否为zip文件
-                    if log_path.lower().endswith('.zip'):
-                        # 处理压缩文件
-                        self.log_message(f"处理压缩文件: {log_name}")
-                        
-                        # 获取到本地缓存
-                        cache_path = None
-                        try:
-                            import tempfile
-                            import hashlib
-                            
-                            # 创建缓存目录
-                            cache_dir = os.path.join(tempfile.gettempdir(), "log_cache")
-                            os.makedirs(cache_dir, exist_ok=True)
-                            
-                            # 计算文件哈希作为缓存文件名
-                            file_hash = hashlib.md5(log_path.encode()).hexdigest()
-                            file_ext = os.path.splitext(log_path)[1]
-                            cache_path = os.path.join(cache_dir, f"{file_hash}{file_ext}")
-                            
-                            # 如果缓存不存在，下载文件
-                            if not os.path.exists(cache_path):
-                                self.log_message(f"下载文件到本地缓存: {log_name}")
-                                collector.sftp.get(log_path, cache_path)
-                            
-                            # 解压并处理文件
-                            import zipfile
-                            import tempfile
-                            
-                            # 创建临时目录
-                            temp_dir = tempfile.mkdtemp()
-                            
-                            try:
-                                with zipfile.ZipFile(cache_path, 'r') as zip_ref:
-                                    # 解压所有文件
-                                    zip_ref.extractall(temp_dir)
-                                    
-                                    # 处理解压后的每个文件
-                                    for root, dirs, files in os.walk(temp_dir):
-                                        for file in files:
-                                            if file.endswith('.log'):
-                                                file_path = os.path.join(root, file)
-                                                
-                                                # 读取文件内容
-                                                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                                                    content = f.read()
-                                                
-                                                # 写入文件标题
-                                                output_file.write(f"\n\n===== {log_name}/{file} =====\n\n")
-                                                
-                                                # 过滤时间范围内的日志
-                                                filtered_lines = []
-                                                for line in content.splitlines():
-                                                    match = re.search(time_pattern, line)
-                                                    if match:
-                                                        try:
-                                                            timestamp_str = match.group(1)
-                                                            timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
-                                                            if earliest_time <= timestamp <= latest_time:
-                                                                filtered_lines.append(line)
-                                                        except:
-                                                            # 如果时间解析失败，保留这一行
-                                                            if filtered_lines:
-                                                                filtered_lines.append(line)
-                                                    else:
-                                                        # 如果没有时间戳，可能是上一条日志的延续
-                                                        if filtered_lines:
-                                                            filtered_lines.append(line)
-                                                
-                                                # 写入过滤后的内容
-                                                output_file.write('\n'.join(filtered_lines))
-                            finally:
-                                # 清理临时目录
-                                import shutil
-                                shutil.rmtree(temp_dir)
-                        except Exception as e:
-                            self.log_message(f"处理压缩文件失败: {str(e)}")
-                            continue
-                    else:
-                        # 处理普通日志文件
-                        self.log_message(f"处理日志文件: {log_name}")
-                        
-                        # 获取文件内容
-                        if collector.is_remote_windows():
-                            cmd = f'type "{log_path}"'
-                        else:
-                            cmd = f'cat "{log_path}"'
-                        
-                        stdin, stdout, stderr = collector.ssh.exec_command(cmd)
-                        try:
-                            content = stdout.read().decode('utf-8', errors='ignore')
-                        except:
-                            content = stdout.read().decode('gbk', errors='ignore')
-                        
-                        # 写入文件标题
-                        output_file.write(f"\n\n===== {log_name} =====\n\n")
-                        
-                        # 过滤时间范围内的日志
-                        filtered_lines = []
-                        for line in content.splitlines():
-                            match = re.search(time_pattern, line)
-                            if match:
-                                try:
-                                    timestamp_str = match.group(1)
-                                    timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
-                                    if earliest_time <= timestamp <= latest_time:
-                                        filtered_lines.append(line)
-                                except:
-                                    # 如果时间解析失败，保留这一行
-                                    if filtered_lines:
-                                        filtered_lines.append(line)
-                            else:
-                                # 如果没有时间戳，可能是上一条日志的延续
-                                if filtered_lines:
-                                    filtered_lines.append(line)
-                        
-                        # 写入过滤后的内容
-                        output_file.write('\n'.join(filtered_lines))
-                
-                self.log_message(f"时间范围日志已导出到: {file_path}")
-                QMessageBox.information(self, "导出成功", f"时间范围日志已导出到:\n{file_path}")
+                # 获取完整日志
+                self.log_message(f"正在获取完整日志: {file_path}")
+                self.analysis_worker = LogAnalysisWorker(self.config, mode='full', log_path=file_path)
+                self.analysis_worker.complete_log.connect(self.display_full_log)
+                self.analysis_worker.error.connect(self.analysis_error)
+                self.analysis_worker.log_message_signal.connect(self.log_message)
+                self.analysis_worker.start()
         except Exception as e:
-            self.log_message(f"导出时间范围日志失败: {str(e)}")
-            QMessageBox.critical(self, "导出失败", f"导出失败：\n{str(e)}")
-        finally:
-            # 关闭连接并关闭进度对话框
-            if 'collector' in locals():
-                collector.close()
-            progress_dialog.accept()
+            self.error.emit(f"获取完整日志时出错: {str(e)}")
+    
+    def display_full_log(self, full_log):
+        """显示完整日志"""
+        self.complete_log.emit(full_log)
+    
+    def export_results(self):
+        """导出搜索结果"""
+        # 获取搜索结果
+        keyword = self.keyword_input.text().strip()
+        if not keyword:
+            QMessageBox.warning(self, "警告", "请输入要搜索的关键字")
+            return
+        
+        # 获取选中的日志文件
+        selected_rows = self.log_list.selectionModel().selectedRows()
+        if not selected_rows:
+            QMessageBox.warning(self, "警告", "请先选择要导出搜索结果的日志文件")
+            return
+        
+        # 获取选中文件的路径和文件名
+        selected_files = []
+        for row in selected_rows:
+            file_path = self.log_list.item(row.row(), 0).data(Qt.ItemDataRole.UserRole)
+            if file_path:
+                selected_files.append(file_path)
+        
+        if not selected_files:
+            QMessageBox.warning(self, "警告", "没有选中任何日志文件")
+            return
+        
+        # 创建进度对话框
+        progress = QProgressDialog("正在导出搜索结果...", "取消", 0, len(selected_files), self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+        
+        # 开始导出搜索结果
+        try:
+            for i, file_path in enumerate(selected_files):
+                # 更新进度
+                progress.setValue(i)
+                if progress.wasCanceled():
+                    break
+                
+                # 导出搜索结果
+                self.log_message(f"正在导出搜索结果: {file_path}")
+                self.analysis_worker = LogAnalysisWorker(self.config, mode='search', log_path=file_path, keyword=keyword)
+                self.analysis_worker.search_result.connect(self.append_search_result)
+                self.analysis_worker.error.connect(self.analysis_error)
+                self.analysis_worker.log_message_signal.connect(self.log_message)
+                self.analysis_worker.start()
+        except Exception as e:
+            self.error.emit(f"导出搜索结果时出错: {str(e)}")
+    
+    def append_search_result(self, keyword, results):
+        """添加搜索结果"""
+        self.result_text.append(f"\n\n===== 搜索关键字: {keyword} =====\n\n")
+        for result in results:
+            self.result_text.append(f"{result['file']}:{result['line_num']}: {result['content']}\n")
+        self.log_message(f"搜索结果已添加到结果区域")
+    
+    def export_time_range_logs(self):
+        """导出时间范围日志"""
+        # 获取时间范围设置
+        start_date = self.analysis_start_date.date().toString('yyyy-MM-dd')
+        end_date = self.analysis_end_date.date().toString('yyyy-MM-dd')
+        
+        # 获取选中的日志文件
+        selected_rows = self.log_list.selectionModel().selectedRows()
+        if not selected_rows:
+            QMessageBox.warning(self, "警告", "请先选择要导出时间范围日志的日志文件")
+            return
+        
+        # 获取选中文件的路径和文件名
+        selected_files = []
+        for row in selected_rows:
+            file_path = self.log_list.item(row.row(), 0).data(Qt.ItemDataRole.UserRole)
+            if file_path:
+                selected_files.append(file_path)
+        
+        if not selected_files:
+            QMessageBox.warning(self, "警告", "没有选中任何日志文件")
+            return
+        
+        # 创建进度对话框
+        progress = QProgressDialog("正在导出时间范围日志...", "取消", 0, len(selected_files), self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+        
+        # 开始导出时间范围日志
+        try:
+            for i, file_path in enumerate(selected_files):
+                # 更新进度
+                progress.setValue(i)
+                if progress.wasCanceled():
+                    break
+                
+                # 导出时间范围日志
+                self.log_message(f"正在导出时间范围日志: {file_path}")
+                self.analysis_worker = LogAnalysisWorker(self.config, mode='list', log_path=file_path)
+                self.analysis_worker.log_list.connect(self.append_time_range_log)
+                self.analysis_worker.error.connect(self.analysis_error)
+                self.analysis_worker.log_message_signal.connect(self.log_message)
+                self.analysis_worker.start()
+        except Exception as e:
+            self.error.emit(f"导出时间范围日志时出错: {str(e)}")
+    
+    def append_time_range_log(self, logs):
+        """添加时间范围日志"""
+        self.result_text.append(f"\n\n===== 时间范围日志: {self.analysis_start_date.date().toString('yyyy-MM-dd')} - {self.analysis_end_date.date().toString('yyyy-MM-dd')} =====\n\n")
+        for log in logs:
+            self.result_text.append(f"{log['name']}:{log['date']}: {log['size']}\n")
+        self.log_message(f"时间范围日志已添加到结果区域")
 
-def main():
+if __name__ == '__main__':
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
-
-if __name__ == "__main__":
-    main()
- 
